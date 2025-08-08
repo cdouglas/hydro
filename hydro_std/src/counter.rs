@@ -3,58 +3,61 @@ use std::hash::Hash;
 use hydro_lang::{location::tick::NoAtomic, *};
 use hydro_lang::keyed_stream::KeyedStream;
 use lattices::algebra::abelian_group;
-use lattices::{Addition, AdditiveInverse};
+use lattices::{AbelianGroup, Addition, AdditiveInverse};
 use location::NoTick;
 use serde::{Deserialize, Serialize};
 
 /// Commands for counter operations using abelian group structure
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum CounterCommand<K> {
+pub enum CounterCommand<K,V> {
     /// Increment counter by a value (uses group operation)
-    Increment(K, i32),
+    Increment(K, V),
     /// Decrement counter by a value (uses group inverse operation)
-    Decrement(K, i32),
+    Decrement(K, V),
     /// Get current counter value
     Get(K),
     /// Reset counter to identity element (0)
     Reset(K),
 }
 
-use lattices::{Zero};
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CounterValue(i32);
+pub struct CounterValue<T: AbelianGroup<T>> { value: T }
 
-impl Default for CounterValue {
-    fn default() -> Self {
-        CounterValue(0)
+impl <T: AbelianGroup<T> + Default> CounterValue<T> {
+    pub fn new(value: T) -> Self {
+        CounterValue {
+            value
+        }
+    }
+
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+
+    pub fn identity() -> T {
+        T::identity()
     }
 }
 
-impl CounterValue {
-    pub fn new(value: i32) -> Self {
-        CounterValue(value)
-    }
-
-    pub fn value(&self) -> i32 {
-        self.0
-    }
-}
-
-impl AdditiveInverse for CounterValue {
+impl <T: AbelianGroup<T>> AdditiveInverse for CounterValue<T> {
     fn inverse(&self) -> Self {
-        CounterValue(-self.0)
+        CounterValue {
+            value: self.value.inverse()
+        }
     }
 }
 
-impl Zero<CounterValue> for CounterValue {
-    fn zero(&self) -> Self {
-        CounterValue(0)
+impl <T: AbelianGroup<T>> Default for CounterValue<T> {
+    fn default() -> Self {
+        CounterValue {
+            value: T::identity()
+        }
     }
 }
 
-impl Addition<CounterValue> for CounterValue {
+impl <T: AbelianGroup<T>> Addition<CounterValue<T>> for CounterValue<T> {
     fn add(&mut self, other: Self) {
-        self.0 = self.0.wrapping_add(other.0);
+        self.value.add(other.value);
     }
 
     fn add_owned(mut self, other: Self) -> Self {
@@ -65,9 +68,9 @@ impl Addition<CounterValue> for CounterValue {
 
 /// Response from counter operations
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CounterResponse<K> {
+pub struct CounterResponse<K,V> {
     pub key: K,
-    pub value: i32,
+    pub value: V,
     pub operation: String,
 }
 
@@ -87,20 +90,18 @@ fn verify_abelian_group() -> Result<(), &'static str> {
 
 /// Create a distributed counter that maintains state using abelian group properties
 #[expect(clippy::type_complexity, reason = "complex stream types for distributed systems")]
-pub fn local_counter<'a, L: Location<'a> + NoTick + NoAtomic, Order, K: Clone + Eq + Hash>(
-    commands: KeyedStream<u64, CounterCommand<K>, Atomic<L>, Unbounded, Order>,
+pub fn abelian_group_register<'a, T, L: Location<'a> + NoTick + NoAtomic, Order, K: Clone + Eq + Hash>(
+    commands: KeyedStream<u64, CounterCommand<K,T>, Atomic<L>, Unbounded, Order>,
 ) -> (
-    KeyedStream<u64, CounterResponse<K>, L, Unbounded, NoOrder>,
+    KeyedStream<u64, CounterResponse<K,T>, L, Unbounded, NoOrder>,
     KeyedStream<u64, (K, String), L, Unbounded, NoOrder>, // error stream
-) {
-    // Verify abelian group properties at startup
-    let _verification = verify_abelian_group();
-    
+)
+    where T: AbelianGroup<T> + Clone + Default {
     // Convert commands to (key, operation) pairs for state tracking
     let operations = commands.clone().filter_map(q!(|cmd| match cmd {
         CounterCommand::Increment(key, delta) => Some((key, delta)),
-        CounterCommand::Decrement(key, delta) => Some((key, -delta)), // Use abelian group inverse
-        CounterCommand::Reset(key) => Some((key, i32::MIN)), // Special marker for reset
+        CounterCommand::Decrement(key, delta) => Some((key, delta.inverse())), // Use abelian group inverse
+        CounterCommand::Reset(key) => Some((key, T::default())), // Special marker for reset
         CounterCommand::Get(_) => None, // Get operations don't modify state
     }));
 
@@ -109,7 +110,7 @@ pub fn local_counter<'a, L: Location<'a> + NoTick + NoAtomic, Order, K: Clone + 
         .into_keyed()
         .fold_commutative(
             q!(|| CounterValue::default()),
-            q!(|counter: &mut CounterValue, delta| {
+            q!(|counter: &mut CounterValue<T>, delta| {
                 counter.add(CounterValue::new(delta));
             })
         );
@@ -124,7 +125,7 @@ pub fn local_counter<'a, L: Location<'a> + NoTick + NoAtomic, Order, K: Clone + 
             (c,
             CounterResponse {
                 key: k,
-                value: v.value(),
+                value: v.value,
                 operation: if d == i32::MIN {
                     "reset".to_string()
                 } else if d > 0 {
@@ -191,17 +192,6 @@ pub fn local_counter<'a, L: Location<'a> + NoTick + NoAtomic, Order, K: Clone + 
     (responses, errors.entries().end_atomic().into_keyed())
 }
 
-/// Create a distributed counter (alias for local_counter for backward compatibility)
-#[expect(clippy::type_complexity, reason = "complex stream types for distributed systems")]
-pub fn distributed_counter<'a, L: Location<'a> + NoTick + NoAtomic, Order, K: Clone + Eq + Hash>(
-    commands: KeyedStream<u64, CounterCommand<K>, Atomic<L>, Unbounded, Order>,
-) -> (
-    KeyedStream<u64, CounterResponse<K>, L, Unbounded, NoOrder>,
-    KeyedStream<u64, (K, String), L, Unbounded, NoOrder>, // error stream
-) {
-    local_counter(commands)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,7 +220,7 @@ mod tests {
         
         // Use the distributed counter
         let tick = process_node.tick();
-        let (responses, _errors) = distributed_counter(input.atomic(&tick));
+        let (responses, _errors) = abelian_group_register(input.atomic(&tick));
         // let out = responses.send_bincode_external(&external);
         
         complete_sink.complete(responses);

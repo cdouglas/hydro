@@ -51,8 +51,12 @@ pub trait Semiring<T>: Addition<T> + Multiplication<T> + Zero<T> + One<T> {}
 
 /// Alias trait for Abelian groups.
 #[sealed]
-pub trait AbelianGroup<T>: Addition<T> + AdditiveInverse + Zero<T> {}
-impl<T> AbelianGroup<T> for T where T: Addition<Self> + AdditiveInverse + Zero<Self> + Sealed<Self> {}
+pub trait AbelianGroup<T>: Addition<T> + AdditiveInverse {
+    /// Returns the identity element for the group.
+    fn identity() -> T;
+}
+
+// impl<T> AbelianGroup<T> for T where T: Addition<Self> + AdditiveInverse + Sealed<Self> {}
 
 /// Trait for Semiring Addition.
 pub trait Addition<Other> {
