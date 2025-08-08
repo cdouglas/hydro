@@ -4,6 +4,8 @@
 use std::cmp::Ordering::{self, *};
 
 use sealed::sealed;
+use crate::__seal_abelian_group::Sealed;
+
 pub use {cc_traits, variadics};
 
 /// Module for definiting algebraic structures and properties.
@@ -47,6 +49,11 @@ impl<T> Lattice for T where T: Sized + Merge<Self> + LatticeOrd + NaiveLatticeOr
 #[sealed]
 pub trait Semiring<T>: Addition<T> + Multiplication<T> + Zero<T> + One<T> {}
 
+/// Alias trait for Abelian groups.
+#[sealed]
+pub trait AbelianGroup<T>: Addition<T> + AdditiveInverse + Zero<T> {}
+impl<T> AbelianGroup<T> for T where T: Addition<Self> + AdditiveInverse + Zero<Self> + Sealed<Self> {}
+
 /// Trait for Semiring Addition.
 pub trait Addition<Other> {
     /// Add-assign `other` into self.
@@ -60,6 +67,22 @@ pub trait Addition<Other> {
         self.add(other);
         self
     }
+}
+
+/// Trait for additive inverses.
+pub trait AdditiveInverse
+{
+    /// Inverse of `self`
+    fn inverse(&self) -> Self;
+
+    /// Inverse of `self` addition, returning a new value.
+    fn inverse_owned(self) -> Self
+    where
+        Self: Sized,
+    {
+        self.inverse()
+    }
+
 }
 
 /// Trait for Semiring Multiplication.

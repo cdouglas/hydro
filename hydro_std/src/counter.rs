@@ -3,6 +3,7 @@ use std::hash::Hash;
 use hydro_lang::{location::tick::NoAtomic, *};
 use hydro_lang::keyed_stream::KeyedStream;
 use lattices::algebra::abelian_group;
+use lattices::{Addition, AdditiveInverse};
 use location::NoTick;
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +18,49 @@ pub enum CounterCommand<K> {
     Get(K),
     /// Reset counter to identity element (0)
     Reset(K),
+}
+
+use lattices::{Zero};
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CounterValue(i32);
+
+impl Default for CounterValue {
+    fn default() -> Self {
+        CounterValue(0)
+    }
+}
+
+impl CounterValue {
+    pub fn new(value: i32) -> Self {
+        CounterValue(value)
+    }
+
+    pub fn value(&self) -> i32 {
+        self.0
+    }
+}
+
+impl AdditiveInverse for CounterValue {
+    fn inverse(&self) -> Self {
+        CounterValue(-self.0)
+    }
+}
+
+impl Zero<CounterValue> for CounterValue {
+    fn zero(&self) -> Self {
+        CounterValue(0)
+    }
+}
+
+impl Addition<CounterValue> for CounterValue {
+    fn add(&mut self, other: Self) {
+        self.0 = self.0.wrapping_add(other.0);
+    }
+
+    fn add_owned(mut self, other: Self) -> Self {
+        self.add(other);
+        self
+    }
 }
 
 /// Response from counter operations
@@ -39,7 +83,6 @@ fn verify_abelian_group() -> Result<(), &'static str> {
         COUNTER_IDENTITY, 
         &|a: i32| a.wrapping_neg()
     )
- //    abelian_group(TEST_ITEMS, &u32::wrapping_add, 0, &|x| 0u32.wrapping_sub(x)).is_ok()
 }
 
 /// Create a distributed counter that maintains state using abelian group properties
@@ -65,16 +108,10 @@ pub fn local_counter<'a, L: Location<'a> + NoTick + NoAtomic, Order, K: Clone + 
     let counter_states = operations.clone().values()
         .into_keyed()
         .fold_commutative(
-            q!(|| 0i32), // Start with identity element
-            q!(|counter: &mut i32, delta| {
-                if delta == i32::MIN {
-                    // Reset operation - set to identity element
-                    *counter = 0; // COUNTER_IDENTITY
-                } else {
-                    // Use abelian group operation (addition)
-                    *counter = counter.wrapping_add(delta);
-                }
-            }),
+            q!(|| CounterValue::default()),
+            q!(|counter: &mut CounterValue, delta| {
+                counter.add(CounterValue::new(delta));
+            })
         );
 
     // set of operations processed in this batch
@@ -87,7 +124,7 @@ pub fn local_counter<'a, L: Location<'a> + NoTick + NoAtomic, Order, K: Clone + 
             (c,
             CounterResponse {
                 key: k,
-                value: v,
+                value: v.value(),
                 operation: if d == i32::MIN {
                     "reset".to_string()
                 } else if d > 0 {
@@ -136,7 +173,7 @@ pub fn local_counter<'a, L: Location<'a> + NoTick + NoAtomic, Order, K: Clone + 
             (c,
             CounterResponse {
                 key,
-                value,
+                value: value.value(),
                 operation: "get".to_string(),
             })
         }))
@@ -207,6 +244,7 @@ mod tests {
 
         let (external_out, mut external_in) = nodes.connect_bincode(in_port).await;
         // let mut external_out = nodes.connect_source_bincode(out).await;
+        let mut external_out = Box::pin(external_out);
 
         deployment.start().await.unwrap();
 
@@ -220,8 +258,8 @@ mod tests {
         external_in.send(CounterCommand::Get("test_counter".to_string())).await.unwrap();
 
         // Collect responses
-        let responses: Vec<_> = external_out.take(3).collect().await;
-        
+        let responses: Vec<_> = external_out.by_ref().take(3).collect().await;
+
         // Verify we got responses for all operations
         assert_eq!(responses.len(), 3);
         dbg!(&responses);
@@ -231,5 +269,11 @@ mod tests {
         assert!(operations.contains("increment") || operations.contains("update"));
         assert!(operations.contains("decrement") || operations.contains("update"));
         assert!(operations.contains("get") || operations.contains("update"));
+
+        external_in.send(CounterCommand::Get("test_counter".to_string())).await.unwrap();
+        let responses: Vec<_> = external_out.by_ref().take(1).collect().await;
+        assert_eq!(responses.len(), 1);
+        dbg!(&responses);
+        assert!(responses.iter().all(|r| r.value == 3));
     }
 }
