@@ -4,8 +4,6 @@
 use std::cmp::Ordering::{self, *};
 
 use sealed::sealed;
-use crate::__seal_abelian_group::Sealed;
-
 pub use {cc_traits, variadics};
 
 /// Module for definiting algebraic structures and properties.
@@ -74,8 +72,7 @@ pub trait Addition<Other> {
 }
 
 /// Trait for additive inverses.
-pub trait AdditiveInverse
-{
+pub trait AdditiveInverse {
     /// Inverse of `self`
     fn inverse(&self) -> Self;
 
@@ -86,7 +83,6 @@ pub trait AdditiveInverse
     {
         self.inverse()
     }
-
 }
 
 /// Trait for Semiring Multiplication.
