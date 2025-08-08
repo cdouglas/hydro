@@ -5,6 +5,7 @@ pub mod compartmentalize;
 pub mod membership;
 pub mod quorum;
 pub mod request_response;
+pub mod counter;
 
 #[cfg(test)]
 mod test_init {
