@@ -250,7 +250,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_counter_operations() {
-
         use hydro_deploy::Deployment;
         use hydro_lang::FlowBuilder;
 
