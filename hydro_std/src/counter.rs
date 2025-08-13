@@ -80,14 +80,6 @@ pub struct Ztuple
     pub count: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct JoinResponse {
-    a: u32,
-    b: u32,
-    c: u32,
-    d: u32,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CounterValue<'a, T> {
     pub value: T,
@@ -181,6 +173,7 @@ pub fn basic_join<
         .snapshot()
         .entries()
         .defer_tick()
+        .inspect(q!(|((a, b), count)| { println!("R state: ({}, {})#{}", a, b, count); }))
     };
 
     let s = unsafe {
@@ -191,10 +184,18 @@ pub fn basic_join<
         .snapshot()
         .entries()
         .defer_tick()
+        .inspect(q!(|((a, c, d), count)| { println!("S state: ({}, {}, {})#{}", a, c, d, count); }))
     };
 
     let delta_r = unsafe { r_stream.clone().batch() };
     let delta_s = unsafe { s_stream.clone().batch() };
+
+    r_stream.clone().entries().for_each(q!(|((a, b), count)| {
+        println!("delta R: ({}, {})#{}", a, b, count);
+    }));
+    s_stream.clone().entries().for_each(q!(|((a, c, d), count)| {
+        println!("delta S: ({}, {}, {})#{}", a, c, d, count);
+    }));
 
     // ΔR x ΔS (new R tuples × new S tuples in same tick)
     let delta_r_x_delta_s =
@@ -454,4 +455,98 @@ mod tests {
         dbg!(&responses);
         assert!(responses.iter().all(|r| r.value.value() == 3));
     }
+
+    #[tokio::test]
+    async fn test_basic_join() {
+        use hydro_deploy::Deployment;
+        use hydro_lang::FlowBuilder;
+
+        let mut deployment = Deployment::new();
+
+        let flow = FlowBuilder::new();
+        let process_node = flow.process::<()>();
+        let external = flow.external::<()>();
+
+        let (in_port, input, _membership, complete_sink) =
+            process_node.bidi_external_many_bincode(&external);
+
+        // Use the distributed counter
+        let tick = process_node.tick();
+        let (responses, _errors) =
+            basic_join(input.atomic(&tick));
+        // let out = responses.send_bincode_external(&external);
+
+        complete_sink.complete(responses);
+
+        let nodes = flow
+            .with_process(&process_node, deployment.Localhost())
+            .with_external(&external, deployment.Localhost())
+            .deploy(&mut deployment);
+
+        deployment.deploy().await.unwrap();
+
+        let (external_out, mut external_in) = nodes.connect_bincode(in_port).await;
+        // let mut external_out = nodes.connect_source_bincode(out).await;
+        let mut external_out = Box::pin(external_out);
+
+        deployment.start().await.unwrap();
+
+        // Test increment operation
+        external_in
+            .send(Ztuple {
+                relation: Relation::R { a: 1, b: 2 },
+                count: 1,
+            })
+            .await
+            .unwrap();
+        external_in
+            .send(Ztuple {
+                    relation: Relation::S { a: 1, c: 3, d: 4 },
+                    count: 1,
+                })
+            .await
+            .unwrap();
+        external_in
+            .send(Ztuple {
+                    relation: Relation::S { a: 2, c: 5, d: 6 },
+                    count: 1,
+                })
+            .await
+            .unwrap();
+
+        let responses: Vec<_> = external_out.by_ref().take(3).collect().await;
+        dbg!(&responses);
+        assert_eq!(responses.len(), 3);
+
+        external_in
+            .send(Ztuple {
+                    relation: Relation::S { a: 1, c: 3, d: 5 },
+                    count: 1,
+                })
+            .await
+            .unwrap();
+        let responses: Vec<_> = external_out.by_ref().take(1).collect().await;
+        dbg!(&responses);
+        assert_eq!(responses.len(), 1);
+
+        external_in
+            .send(Ztuple {
+                    relation: Relation::R { a: 1, b: 2 },
+                    count: -1,
+                })
+            .await
+            .unwrap();
+        external_in
+            .send(Ztuple {
+                    relation: Relation::R { a: 1, b: 7 },
+                    count: 2,
+                })
+            .await
+            .unwrap();
+        let responses: Vec<_> = external_out.by_ref().take(2).collect().await;
+        dbg!(&responses);
+        assert_eq!(responses.len(), 2);
+
+    }
+
 }
