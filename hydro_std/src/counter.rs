@@ -66,6 +66,28 @@ where
     Reset(K),
 }
 
+/// placeholder (replace w/ veriadics?)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum Relation {
+    R { a: u32, b: u32 },
+    S { a: u32, c: u32, d: u32 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct Ztuple
+{
+    pub relation: Relation,
+    pub count: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct JoinResponse {
+    a: u32,
+    b: u32,
+    c: u32,
+    d: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CounterValue<'a, T> {
     pub value: T,
@@ -123,6 +145,115 @@ where
     pub key: K,
     pub value: V,
     pub operation: String,
+}
+
+pub fn basic_join<
+    'a,
+    L: Location<'a> + NoTick + NoAtomic,
+    Order,
+>(
+    tuples: KeyedStream<u64, Ztuple, Atomic<L>, Unbounded, Order>,
+) -> (
+    KeyedStream<u64, (), L, Unbounded, NoOrder>,
+    KeyedStream<u64, String, L, Unbounded, NoOrder>,
+) {
+    let r_stream = tuples.clone()
+        .values()
+        .filter_map(q!(|ztuple| match ztuple.relation {
+            Relation::R { a, b } => Some(((a, b), ztuple.count)),
+            _ => None,
+        }))
+        .into_keyed();
+
+    let s_stream = tuples.clone()
+        .values()
+        .filter_map(q!(|ztuple| match ztuple.relation {
+            Relation::S { a, c, d } => Some(((a, c, d), ztuple.count)),
+            _ => None,
+        }))
+        .into_keyed();
+
+    let r = unsafe {
+        r_stream.clone()
+        .fold_commutative(
+            q!(|| 0i32),
+            q!(|acc, count| *acc += count))
+        .snapshot()
+        .entries()
+        .defer_tick()
+    };
+
+    let s = unsafe {
+        s_stream.clone()
+        .fold_commutative(
+            q!(|| 0i32),
+            q!(|acc, count| *acc += count))
+        .snapshot()
+        .entries()
+        .defer_tick()
+    };
+
+    let delta_r = unsafe { r_stream.clone().batch() };
+    let delta_s = unsafe { s_stream.clone().batch() };
+
+    // ΔR x ΔS (new R tuples × new S tuples in same tick)
+    let delta_r_x_delta_s =
+        delta_r
+            .clone()
+            .entries()
+            .map(q!(|((a, b), r_count)| (a, (b, r_count))))
+            .join(delta_s
+                .clone()
+                .entries()
+                .map(q!(|((a, c, d), s_count)| (a, (c, d, s_count)))))
+            .map(q!(|(a, ((b, r_count), (c, d, s_count)))| (a, b, c, d, r_count * s_count)))
+            .all_ticks();
+
+    // R × ΔS (existing R tuples × new S tuples)
+    let r_x_delta_s =
+        r
+            .clone()
+            .map(q!(|((a, b), r_count)| (a, (b, r_count))))
+            .join(delta_s
+                    .entries()
+                    .map(q!(|((a, c, d), s_count)| (a, (c, d, s_count)))))
+            .map(q!(|(a, ((b, r_count), (c, d, s_count)))| (a, b, c, d, r_count * s_count)))
+            .all_ticks();
+
+    // S × ΔR (existing S tuples x new R tuples)
+    let s_x_delta_r =
+        s
+            .clone()
+            .map(q!(|((a, c, d), s_count)| (a, (c, d, s_count))))
+            .join(delta_r
+                .entries()
+                .map(q!(|((a, b), r_count)| (a, (b, r_count)))))
+            .map(q!(|(a, ((c, d, s_count), (b, r_count)))| (a, b, c, d, r_count * s_count)))
+            .all_ticks();
+
+    let join_result = s_x_delta_r
+        .union(r_x_delta_s)
+        .union(delta_r_x_delta_s);
+
+    join_result.clone().for_each(q!(|(a, b, c, d, count)| {
+        println!("output delta: ({}, {}, {}, {})#{}", a, b, c, d, count);
+    }));
+
+    let acks =
+        tuples
+            .clone()
+            .entries()
+            .map(q!(|(id, _)| (id, ())))
+            .end_atomic()
+            .into_keyed();
+
+    let errors = tuples
+        .filter_map(q!(|_| None::<String>))
+        .entries()
+        .end_atomic()
+        .into_keyed();
+
+    (acks, errors)
 }
 
 /// Create a distributed counter that maintains state using group properties
