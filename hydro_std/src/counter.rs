@@ -68,7 +68,7 @@ where
 
 /// placeholder (replace w/ veriadics?)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum Relation {
+pub enum RawTuple {
     R { a: u32, b: u32 },
     S { a: u32, c: u32, d: u32 },
 }
@@ -76,7 +76,7 @@ pub enum Relation {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct Ztuple
 {
-    pub relation: Relation,
+    pub tuple: RawTuple,
     pub count: i32,
 }
 
@@ -151,16 +151,16 @@ pub fn basic_join<
 ) {
     let r_stream = tuples.clone()
         .values()
-        .filter_map(q!(|ztuple| match ztuple.relation {
-            Relation::R { a, b } => Some(((a, b), ztuple.count)),
+        .filter_map(q!(|ztuple| match ztuple.tuple {
+            RawTuple::R { a, b } => Some(((a, b), ztuple.count)),
             _ => None,
         }))
         .into_keyed();
 
     let s_stream = tuples.clone()
         .values()
-        .filter_map(q!(|ztuple| match ztuple.relation {
-            Relation::S { a, c, d } => Some(((a, c, d), ztuple.count)),
+        .filter_map(q!(|ztuple| match ztuple.tuple {
+            RawTuple::S { a, c, d } => Some(((a, c, d), ztuple.count)),
             _ => None,
         }))
         .into_keyed();
@@ -494,21 +494,21 @@ mod tests {
         // Test increment operation
         external_in
             .send(Ztuple {
-                relation: Relation::R { a: 1, b: 2 },
+                tuple: RawTuple::R { a: 1, b: 2 },
                 count: 1,
             })
             .await
             .unwrap();
         external_in
             .send(Ztuple {
-                    relation: Relation::S { a: 1, c: 3, d: 4 },
+                    tuple: RawTuple::S { a: 1, c: 3, d: 4 },
                     count: 1,
                 })
             .await
             .unwrap();
         external_in
             .send(Ztuple {
-                    relation: Relation::S { a: 2, c: 5, d: 6 },
+                    tuple: RawTuple::S { a: 2, c: 5, d: 6 },
                     count: 1,
                 })
             .await
@@ -520,7 +520,7 @@ mod tests {
 
         external_in
             .send(Ztuple {
-                    relation: Relation::S { a: 1, c: 3, d: 5 },
+                    tuple: RawTuple::S { a: 1, c: 3, d: 5 },
                     count: 1,
                 })
             .await
@@ -531,14 +531,14 @@ mod tests {
 
         external_in
             .send(Ztuple {
-                    relation: Relation::R { a: 1, b: 2 },
+                    tuple: RawTuple::R { a: 1, b: 2 },
                     count: -1,
                 })
             .await
             .unwrap();
         external_in
             .send(Ztuple {
-                    relation: Relation::R { a: 1, b: 7 },
+                    tuple: RawTuple::R { a: 1, b: 7 },
                     count: 2,
                 })
             .await
