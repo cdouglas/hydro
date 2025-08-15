@@ -174,21 +174,20 @@ where
         );
 
     // set of operations processed in this batch
-    let change_responses_prefix = unsafe {
+    let change_responses_prefix =
         commands
             .clone()
-            .batch()
+            .batch(nondet!(/** group of commands */))
             .entries()
             .filter_map(q!(|(c, cmd)| match cmd {
                 GroupCommand::Increment(ref key, _)
                 | GroupCommand::Decrement(ref key, _)
                 | GroupCommand::Reset(ref key) => Some((key.clone(), (c, cmd.clone()))),
                 _ => None,
-            }))
-    };
-    let change_responses = unsafe {
+            }));
+    let change_responses =
         change_responses_prefix
-            .join(counter_states.clone().snapshot().entries())
+            .join(counter_states.clone().snapshot(nondet!(/** rollup counter state */)).entries())
             .map(q!(|(k, ((c, cmd), v))| {
                 (
                     c,
@@ -200,8 +199,7 @@ where
                 )
             }))
             .into_keyed()
-            .all_ticks()
-    };
+            .all_ticks();
 
     // Handle get operations by looking up current state
     let get_operations = commands.clone().filter_map(q!(|cmd| match cmd {
@@ -210,12 +208,12 @@ where
     }));
 
     // For get operations, create a simple response (simplified for demo)
-    let get_responses = unsafe {
+    let get_responses =
         get_operations
-            .batch()
+            .batch(nondet!(/** Group */))
             .entries()
             .map(q!(|(c, key)| (key, c)))
-            .join(counter_states.snapshot().entries())
+            .join(counter_states.snapshot(nondet!(/** Dingos */)).entries())
             .map(q!(|(key, (c, value))| {
                 (
                     c,
@@ -227,13 +225,12 @@ where
                 )
             }))
             .into_keyed()
-            .all_ticks()
-    };
+            .all_ticks();
 
     // Combine all responses
     let responses = change_responses
         .entries()
-        .union(get_responses.entries())
+        .interleave(get_responses.entries())
         .into_keyed();
 
     // Error stream (empty for now, but could include validation errors)
