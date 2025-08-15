@@ -6,6 +6,7 @@ pub mod counter;
 pub mod membership;
 pub mod quorum;
 pub mod request_response;
+pub mod join_inc;
 
 #[cfg(test)]
 mod test_init {
