@@ -31,7 +31,7 @@ pub enum Op {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum OpResponse {
     Insert { id: u32 },
-    Get { id: u32, tuples: Vec<ZTuple> },
+    Get { id: u32, tuples: Option<Vec<ZTuple>> },
 }
 
 pub fn demux_rs<'a,
@@ -88,7 +88,6 @@ pub fn inc_join<
         .snapshot(nondet!(/** rollup R state */))
         .entries()
         .defer_tick()
-        .inspect(q!(|((a, b), count)| { println!("R state: ({}, {})#{}", a, b, count); }))
         .filter(q!(|(_, count)| *count != 0));
 
     // S relation
@@ -100,20 +99,12 @@ pub fn inc_join<
         .snapshot(nondet!(/** rollup S state */))
         .entries()
         .defer_tick()
-        .inspect(q!(|((a, c, d), count)| { println!("S state: ({}, {}, {})#{}", a, c, d, count); }))
         .filter(q!(|(_, count)| *count != 0));
 
     // ΔR in this tick
     let delta_r =  r_stream.clone().batch(nondet!(/** group of commands */));
     // ΔS in this tick
     let delta_s =  s_stream.clone().batch(nondet!(/** group of commands */));
-
-    r_stream.clone().entries().for_each(q!(|((a, b), count)| {
-        println!("delta R: ({}, {})#{}", a, b, count);
-    }));
-    s_stream.clone().entries().for_each(q!(|((a, c, d), count)| {
-        println!("delta S: ({}, {}, {})#{}", a, c, d, count);
-    }));
 
     // ΔR x ΔS (new R tuples × new S tuples in same tick)
     let delta_r_x_delta_s =
@@ -213,11 +204,31 @@ pub fn inc_join<
             q!(|acc, zt| acc.push(zt))
         )
         .entries()
-        .inspect(q!(|vtup| { println!("DBG: {:?}", &vtup); }))
-        .map(q!(|((client_id, id), vtup)| ((client_id, OpResponse::Get {
+        .map(q!(|((client_id, id), vtup)| ((client_id, id), Some(vtup))));
+        // .map(q!(|((client_id, id), vtup)| (client_id, OpResponse::Get {
+        //     id,
+        //     tuples: vtup
+        // })));
+
+    let missing_resp = get_reqs.clone()
+        .map(q!(|(_key, (client_id, id))| ((client_id, id), None)))
+        .chain(get_resp.clone())
+        .into_keyed()
+        .fold_commutative(
+            q!(|| None::<Vec<ZTuple>>),
+            q!(|acc, zt| {
+                if let Some(v) = zt {
+                    if acc.replace(v).is_some() {
+                        panic!("expected at most one value from get_reqs");
+                    }
+                }
+            })
+        )
+        .entries()
+        .map(q!(|((client_id, id), vtup)| (client_id, OpResponse::Get {
             id,
-            tuples: vtup
-        }))));
+            tuples: vtup,
+        })));
 
     let errors = ops_batch
         .filter_map(q!(|_| None::<String>))
@@ -225,7 +236,7 @@ pub fn inc_join<
         .all_ticks()
         .into_keyed();
 
-    let responses = insert_resp.chain(get_resp)
+    let responses = insert_resp.chain(missing_resp)
         .all_ticks()
         .into_keyed();
 
@@ -303,7 +314,7 @@ mod tests {
                 key: k,
             }
         };
-        let chk_get = |qid: u32, responses: Vec<OpResponse>, expected: Vec<ZTuple>| {
+        let chk_get = |qid: u32, responses: Vec<OpResponse>, expected: Option<Vec<ZTuple>>| {
             responses.iter()
                 .find(|resp| match resp {
                     OpResponse::Insert { id: msg_id } => *msg_id == qid,
@@ -315,7 +326,15 @@ mod tests {
                                 acc
                             })
                         }
-                        assert_eq!(bag(tuples), bag(&expected));
+                        if let Some(expected) = &expected {
+                            if let Some(tuples) = tuples {
+                                assert_eq!(bag(&tuples), bag(&expected));
+                            } else {
+                                panic!("Expected tuples, but got None");
+                            }
+                        } else {
+                            assert!(tuples.is_none(), "Expected no tuples, but got Some(..)");
+                        }
                         true
                     } else {
                         false
@@ -336,8 +355,8 @@ mod tests {
         let responses: Vec<_> = external_out.by_ref().take(4).collect().await;
         dbg!(&responses);
         assert_eq!(responses.len(), 4);
-        assert!(chk_get(4, responses,
-            vec![ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 4 }, count: 1 }]));
+        assert!(chk_get(4, responses, Some(
+            vec![ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 4 }, count: 1 }])));
 
         //  R: (1, 2)#1
         // ΔS: (1, 3, 5)#1
@@ -352,9 +371,9 @@ mod tests {
         // XXX checking ΔT
         // assert!(chk_get(6, responses,
         //     vec![ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 5 }, count: 1 }]));
-        assert!(chk_get(6, responses,
+        assert!(chk_get(6, responses, Some(
             vec![ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 4 }, count: 1 },
-                 ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 5 }, count: 1 }]));
+                 ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 5 }, count: 1 }])));
 
 
         // ΔR: (1, 2)#-1, (1, 7)#2
@@ -374,9 +393,9 @@ mod tests {
         //          ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 5 }, count: -1 },
         //          ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 4 }, count: 2 },
         //          ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 5 }, count: 2 }]));
-        assert!(chk_get(9, responses,
+        assert!(chk_get(9, responses, Some(
             vec![ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 4 }, count: 2 },
-                 ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 5 }, count: 2 }]));
+                 ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 5 }, count: 2 }])));
 
         // ΔR: (1, 7)#-1,
         //  R: (1, 7)#1
@@ -391,15 +410,24 @@ mod tests {
         // assert!(chk_get(11, responses,
         //     vec![ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 4 }, count: -1 },
         //          ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 5 }, count: -1 }]));
-        assert!(chk_get(11, responses,
+        assert!(chk_get(11, responses, Some(
             vec![ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 4 }, count: 1 },
-                 ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 5 }, count: 1 }]));
+                 ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 5 }, count: 1 }])));
 
-        // XXX this hangs?
-        external_in.send(get_k(1)).await.unwrap();
+        external_in.send(get_k(1)).await.unwrap(); // id 12
         let responses: Vec<_> = external_out.by_ref().take(1).collect().await;
         dbg!(&responses);
         assert_eq!(responses.len(), 1);
+        assert!(chk_get(12, responses, Some(
+            vec![ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 4 }, count: 1 },
+                 ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 5 }, count: 1 }])));
+
+        // key not in output
+        external_in.send(get_k(2)).await.unwrap(); // id 13
+        let responses: Vec<_> = external_out.by_ref().take(1).collect().await;
+        dbg!(&responses);
+        assert_eq!(responses.len(), 1);
+        assert!(chk_get(13, responses, None));
     }
 
     #[tokio::test]
