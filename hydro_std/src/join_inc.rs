@@ -31,7 +31,7 @@ pub enum Op {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum OpResponse {
     Insert { id: u32 },
-    Get { id: u32, tuple: Vec<ZTuple> },
+    Get { id: u32, tuples: Vec<ZTuple> },
 }
 
 pub fn demux_rs<'a,
@@ -71,12 +71,15 @@ pub fn inc_join<
     KeyedStream<u64, OpResponse, L, Unbounded, NoOrder>,
     KeyedStream<u64, String, L, Unbounded, NoOrder>,
 ) {
+    // KeyedStream is Atomic; snapshot and batch are aligned
     let (r_stream, s_stream) = demux_rs(ops.clone()
         .filter_map(q!(|op| match op {
             Op::Insert { tuple, .. } => Some(tuple),
             Op::Get { .. } => None
         })));
+    let ops_batch = ops.batch(nondet!(/** group of commands */));
 
+    // R relation
     let r =
         r_stream.clone()
         .fold_commutative(
@@ -88,6 +91,7 @@ pub fn inc_join<
         .inspect(q!(|((a, b), count)| { println!("R state: ({}, {})#{}", a, b, count); }))
         .filter(q!(|(_, count)| *count != 0));
 
+    // S relation
     let s =
         s_stream.clone()
         .fold_commutative(
@@ -99,7 +103,9 @@ pub fn inc_join<
         .inspect(q!(|((a, c, d), count)| { println!("S state: ({}, {}, {})#{}", a, c, d, count); }))
         .filter(q!(|(_, count)| *count != 0));
 
+    // ΔR in this tick
     let delta_r =  r_stream.clone().batch(nondet!(/** group of commands */));
+    // ΔS in this tick
     let delta_s =  s_stream.clone().batch(nondet!(/** group of commands */));
 
     r_stream.clone().entries().for_each(q!(|((a, b), count)| {
@@ -157,53 +163,71 @@ pub fn inc_join<
         println!("output delta: ({}, {}, {}, {})#{}", a, b, c, d, count);
     }));
 
-    // let key = 1;
-    // let tmp = join_result.clone().entries()
-    //     .filter_map(q!(|((a, b, c, d), count)| {
-    //         if a == key {
-    //             Some(ZTuple {
-    //                 tuple: RawTuple::T { a, b, c, d },
-    //                 count,
-    //             })
-    //         } else {
-    //             None
-    //         }
-    //     }))
-    //     .all_ticks()
-    //     .collect::<Vec<_>>();
+    // TODO had to break this into multiple stmt; can't embed e.g.,
+    // let result = some_stream.clone()
+    //   ...
+    //   .filter_map(q!(|(...)| match op {
+    //     Op::Get { id, key } => Some((id, StructType {
+    //       id,
+    //       field: another_stream.clone()
+    //              .map(q!(|...| ...)) // XXX not allowed?
+    //              .etc()
+    //     })),
+    //     // ...
+    //   }))
 
-    let acks =
-        ops
-            .clone()
-            .entries()
-            .map(q!(|(client_id, op)| match op {
-                Op::Insert{ id, .. } => (client_id, OpResponse::Insert { id }),
-                Op::Get { id, key } => (client_id, OpResponse::Get {
-                    id,
-                    tuple: join_result
-                        .clone()
-                        .filter_map(|((a, b, c, d), count)|
-                             if a == key {
-                                 Some(ZTuple {
-                                     tuple: RawTuple::T { a, b, c, d },
-                                     count,
-                                 })
-                            } else {
-                                None
-                            })
-                        .collect::<Vec<_>>()
-                    }),
-            }))
-            .end_atomic()
-            .into_keyed();
+    // response: insert ACKs
+    let insert_resp = ops_batch.clone()
+        .entries()
+        .filter_map(q!(|(client_id, op)| match op {
+            Op::Insert { id, .. } => Some((client_id, OpResponse::Insert { id })),
+            _ => None,
+        }));
 
-    let errors = ops
+    // (key, (client_id, id)) from ops
+    let get_reqs = ops_batch.clone()
+        .entries()
+        .filter_map(q!(|(client_id, op)| match op {
+            Op::Get { id, key } => Some((key, (client_id, id))),
+            _ => None
+        }));
+
+    // (key, ztuple) from join_result
+    let result_keyed = join_result
+        .clone()
+        .entries()
+        .map(q!(|((a, b, c, d), count)| (a, ZTuple {
+            tuple: RawTuple::T { a, b, c, d },
+            count,
+        })));
+
+    // (_key, ((client_id, id), ztuple)) -> (client_id, OpResponse::Get { .. })
+    let get_resp = get_reqs.clone()
+        .join(result_keyed.clone())
+        .map(q!(|(_key, ((client_id, id), ztuple))| ((client_id, id), ztuple.clone())))
+        .into_keyed()
+        .fold_commutative(
+            q!(|| Vec::<ZTuple>::new()),
+            q!(|acc, zt| acc.push(zt))
+        )
+        .entries()
+        .inspect(q!(|vtup| { println!("DBG: {:?}", &vtup); }))
+        .map(q!(|((client_id, id), vtup)| ((client_id, OpResponse::Get {
+            id,
+            tuples: vtup
+        }))));
+
+    let errors = ops_batch
         .filter_map(q!(|_| None::<String>))
         .entries()
-        .end_atomic()
+        .all_ticks()
         .into_keyed();
 
-    (acks, errors)
+    let responses = insert_resp.chain(get_resp)
+        .all_ticks()
+        .into_keyed();
+
+    (responses, errors)
 }
 
 #[cfg(test)]
@@ -227,7 +251,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_basic_join() {
+    async fn test_inc_join_full() {
         use hydro_deploy::Deployment;
         use hydro_lang::FlowBuilder;
 
@@ -240,11 +264,9 @@ mod tests {
         let (in_port, input, _membership, complete_sink) =
             process_node.bidi_external_many_bincode(&external);
 
-        // Use the distributed counter
         let tick = process_node.tick();
         let (responses, _errors) =
             inc_join(input.atomic(&tick));
-        // let out = responses.send_bincode_external(&external);
 
         complete_sink.complete(responses);
 
@@ -255,14 +277,11 @@ mod tests {
 
         deployment.deploy().await.unwrap();
 
-        let (external_out, mut external_in) = nodes.connect_bincode(in_port).await;
-        // let mut external_out = nodes.connect_source_bincode(out).await;
-        let mut external_out = Box::pin(external_out);
+        let (mut external_out, mut external_in) = nodes.connect_bincode(in_port).await;
 
         deployment.start().await.unwrap();
 
         let msg_id = Rc::new(RefCell::new(0u32));
-        // Reusable closures (currently unused below, but available for future refactors)
         let ins_r = {
             let msg_id = Rc::clone(&msg_id);
             move |(a, b), count| make_insert(&msg_id, RawTuple::R { a, b }, count)
@@ -281,27 +300,79 @@ mod tests {
                 key: k,
             }
         };
+        let chk_get = |qid: u32, responses: Vec<OpResponse>, expected: Vec<ZTuple>| {
+            responses.iter()
+                .find(|resp| match resp {
+                    OpResponse::Insert { id: msg_id } => *msg_id == qid,
+                    OpResponse::Get { id: msg_id, tuples } => if *msg_id == qid {
+                        // XXX check shouldn't depend on order
+                        assert_eq!(tuples, &expected);
+                        true
+                    } else {
+                        false
+                    },
+                })
+                .is_some()
+        };
 
-        // Test increment operation
+        //  R: (1, 2)
+        //  S: (1, 3, 4), (2, 5, 6)
+        // ΔT: (1, 2, 3, 4)#1
+        //  T: (1, 2, 3, 4)#1
         external_in.send(ins_r((1, 2), 1)).await.unwrap();
         external_in.send(ins_s((1, 3, 4), 1)).await.unwrap();
         external_in.send(ins_s((2, 5, 6), 1)).await.unwrap();
+        external_in.send(get_k(1)).await.unwrap(); // id 4
 
-        let responses: Vec<_> = external_out.by_ref().take(3).collect().await;
+        let responses: Vec<_> = external_out.by_ref().take(4).collect().await;
         dbg!(&responses);
-        assert_eq!(responses.len(), 3);
+        assert_eq!(responses.len(), 4);
+        assert!(chk_get(4, responses,
+            vec![ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 4 }, count: 1 }]));
 
+        //  R: (1, 2)#1
+        // ΔS: (1, 3, 5)#1
+        //  S: (1, 3, 4)#1, (1, 3, 5)#1, (2, 5, 6)#1
+        // ΔT: (1, 2, 3, 5)#1
+        //  T: (1, 2, 3, 4)#1, (1, 2, 3, 5)#1
         external_in.send(ins_s((1, 3, 5), 1)).await.unwrap();
-        let responses: Vec<_> = external_out.by_ref().take(1).collect().await;
+        external_in.send(get_k(1)).await.unwrap(); // id 6
+        let responses: Vec<_> = external_out.by_ref().take(2).collect().await;
         dbg!(&responses);
-        assert_eq!(responses.len(), 1);
+        assert_eq!(responses.len(), 2);
+        assert!(chk_get(6, responses,
+            vec![ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 4 }, count: 1 },
+                 ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 5 }, count: 1 }]));
 
+
+        // ΔR: (1, 2)#-1, (1, 7)#2
+        //  R: (1, 7)#2
+        //  S: (1, 3, 4)#1, (1, 3, 5)#1, (2, 5, 6)#1
+        // ΔT: (1, 2, 3, 4)#-1, (1, 2, 3, 5)#-1
+        //     (1, 7, 3, 4)#2, (1, 7, 3, 5)#2
+        //  T: (1, 7, 3, 4)#2, (1, 7, 3, 5)#2
         external_in.send(ins_r((1, 2), -1)).await.unwrap();
         external_in.send(ins_r((1, 7), 2)).await.unwrap();
         let responses: Vec<_> = external_out.by_ref().take(2).collect().await;
         dbg!(&responses);
         assert_eq!(responses.len(), 2);
 
+        // ΔR: (1, 7)#-1,
+        //  R: (1, 7)#1
+        //  S: (1, 3, 4)#1, (1, 3, 5)#1, (2, 5, 6)#1
+        // ΔT: (1, 7, 3, 4)#-1, (1, 7, 3, 5)#-1
+        //  T: (1, 7, 3, 4)#1, (1, 7, 3, 5)#1
+        external_in.send(ins_r((1, 7), -1)).await.unwrap();
+        external_in.send(get_k(1)).await.unwrap();
+        let responses: Vec<_> = external_out.by_ref().take(2).collect().await;
+        dbg!(&responses);
+        assert_eq!(responses.len(), 2);
+
+        // XXX this hangs?
+        external_in.send(get_k(1)).await.unwrap();
+        let responses: Vec<_> = external_out.by_ref().take(1).collect().await;
+        dbg!(&responses);
+        assert_eq!(responses.len(), 1);
     }
 
     #[tokio::test]
@@ -319,8 +390,9 @@ mod tests {
             process_node.bidi_external_many_bincode(&external);
 
 
-        // Use the distributed counter
         let tick = process_node.tick();
+        // .atomic(..) to process in batches? Do we need to specify
+        // this for the straight-join version?
         let (r_stream, s_stream) = demux_rs(input.atomic(&tick));
         let s_stream =
             s_stream.entries();
