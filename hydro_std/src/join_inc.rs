@@ -234,6 +234,7 @@ pub fn inc_join<
 mod tests {
     use std::{cell::RefCell, rc::Rc};
 
+    use std::collections::HashMap;
     use futures::{SinkExt, StreamExt};
 
     use super::*;
@@ -305,8 +306,14 @@ mod tests {
                 .find(|resp| match resp {
                     OpResponse::Insert { id: msg_id } => *msg_id == qid,
                     OpResponse::Get { id: msg_id, tuples } => if *msg_id == qid {
-                        // XXX check shouldn't depend on order
-                        assert_eq!(tuples, &expected);
+                        fn bag(v: &[ZTuple]) -> HashMap<ZTuple, i32> {
+                            v.iter().fold(HashMap::new(),
+                            |mut acc, zt| {
+                                *acc.entry(zt.clone()).or_insert(0) += zt.count;
+                                acc
+                            })
+                        }
+                        assert_eq!(bag(tuples), bag(&expected));
                         true
                     } else {
                         false
@@ -340,9 +347,12 @@ mod tests {
         let responses: Vec<_> = external_out.by_ref().take(2).collect().await;
         dbg!(&responses);
         assert_eq!(responses.len(), 2);
+        // XXX checking ΔT
         assert!(chk_get(6, responses,
-            vec![ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 4 }, count: 1 },
-                 ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 5 }, count: 1 }]));
+            vec![ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 5 }, count: 1 }]));
+        // assert!(chk_get(6, responses,
+        //     vec![ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 4 }, count: 1 },
+        //          ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 5 }, count: 1 }]));
 
 
         // ΔR: (1, 2)#-1, (1, 7)#2
@@ -353,9 +363,15 @@ mod tests {
         //  T: (1, 7, 3, 4)#2, (1, 7, 3, 5)#2
         external_in.send(ins_r((1, 2), -1)).await.unwrap();
         external_in.send(ins_r((1, 7), 2)).await.unwrap();
-        let responses: Vec<_> = external_out.by_ref().take(2).collect().await;
+        external_in.send(get_k(1)).await.unwrap(); // id 9
+        let responses: Vec<_> = external_out.by_ref().take(3).collect().await;
         dbg!(&responses);
-        assert_eq!(responses.len(), 2);
+        assert_eq!(responses.len(), 3);
+        assert!(chk_get(9, responses,
+            vec![ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 4 }, count: -1 },
+                 ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 5 }, count: -1 },
+                 ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 4 }, count: 2 },
+                 ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 5 }, count: 2 }]));
 
         // ΔR: (1, 7)#-1,
         //  R: (1, 7)#1
@@ -363,10 +379,13 @@ mod tests {
         // ΔT: (1, 7, 3, 4)#-1, (1, 7, 3, 5)#-1
         //  T: (1, 7, 3, 4)#1, (1, 7, 3, 5)#1
         external_in.send(ins_r((1, 7), -1)).await.unwrap();
-        external_in.send(get_k(1)).await.unwrap();
+        external_in.send(get_k(1)).await.unwrap(); // id 11
         let responses: Vec<_> = external_out.by_ref().take(2).collect().await;
         dbg!(&responses);
         assert_eq!(responses.len(), 2);
+        assert!(chk_get(11, responses,
+            vec![ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 4 }, count: -1 },
+                 ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 5 }, count: -1 }]));
 
         // XXX this hangs?
         external_in.send(get_k(1)).await.unwrap();
