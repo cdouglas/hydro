@@ -150,11 +150,13 @@ pub fn inc_join<
     let join_result = s_x_delta_r
                 .chain(r_x_delta_s)
                 .chain(delta_r_x_delta_s)
+                .all_ticks_atomic()
                 .into_keyed()
                 .fold_commutative(
                     q!(|| 0i32),
                     q!(|acc, count| *acc += count))
-                .filter(q!(|count| *count != 0));
+                .filter(q!(|count| *count != 0))
+                .snapshot(nondet!(/** rollup join result */));
 
     join_result.clone().entries()
             .map(q!(|((a, b, c, d), count)| (a, b, c, d, count)))
@@ -348,11 +350,11 @@ mod tests {
         dbg!(&responses);
         assert_eq!(responses.len(), 2);
         // XXX checking ΔT
-        assert!(chk_get(6, responses,
-            vec![ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 5 }, count: 1 }]));
         // assert!(chk_get(6, responses,
-        //     vec![ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 4 }, count: 1 },
-        //          ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 5 }, count: 1 }]));
+        //     vec![ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 5 }, count: 1 }]));
+        assert!(chk_get(6, responses,
+            vec![ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 4 }, count: 1 },
+                 ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 5 }, count: 1 }]));
 
 
         // ΔR: (1, 2)#-1, (1, 7)#2
@@ -367,10 +369,13 @@ mod tests {
         let responses: Vec<_> = external_out.by_ref().take(3).collect().await;
         dbg!(&responses);
         assert_eq!(responses.len(), 3);
+        // assert!(chk_get(9, responses,
+        //     vec![ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 4 }, count: -1 },
+        //          ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 5 }, count: -1 },
+        //          ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 4 }, count: 2 },
+        //          ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 5 }, count: 2 }]));
         assert!(chk_get(9, responses,
-            vec![ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 4 }, count: -1 },
-                 ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 5 }, count: -1 },
-                 ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 4 }, count: 2 },
+            vec![ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 4 }, count: 2 },
                  ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 5 }, count: 2 }]));
 
         // ΔR: (1, 7)#-1,
@@ -383,9 +388,12 @@ mod tests {
         let responses: Vec<_> = external_out.by_ref().take(2).collect().await;
         dbg!(&responses);
         assert_eq!(responses.len(), 2);
+        // assert!(chk_get(11, responses,
+        //     vec![ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 4 }, count: -1 },
+        //          ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 5 }, count: -1 }]));
         assert!(chk_get(11, responses,
-            vec![ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 4 }, count: -1 },
-                 ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 5 }, count: -1 }]));
+            vec![ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 4 }, count: 1 },
+                 ZTuple { tuple: RawTuple::T { a: 1, b: 7, c: 3, d: 5 }, count: 1 }]));
 
         // XXX this hangs?
         external_in.send(get_k(1)).await.unwrap();
