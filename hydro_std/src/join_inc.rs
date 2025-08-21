@@ -547,8 +547,10 @@ mod tests {
             .filter(q!(|count| *count != 0));
 
         let tick = process_node.tick();
-        let r_x_s = delta_r_x_s.snapshot(&tick, nondet!(/** rollup join result */));
-        let result_keyed = r_x_s.clone()
+        let r_x_s = delta_r_x_s
+            .atomic(&tick)
+            .snapshot(nondet!(/** rollup join result */));
+        let result_keyed = r_x_s
             .entries()
             .map(q!(|((a, b, c, d), count)| (a, ZTuple {
                 tuple: RawTuple::T { a, b, c, d },
@@ -558,18 +560,20 @@ mod tests {
         // TODO: how to ACK after the insert applies to the join... but not make
         // it part of the join state?
         let insert_responses = insert_input
-            .map(q!(|((client_id, msg_id), _)| (client_id, OpResponse::Insert { id: msg_id })))
-            .into_keyed();
+            .atomic(&tick)
+            .batch(nondet!(/** batch insert requests */))
+            .map(q!(|((client_id, msg_id), _)| (client_id, OpResponse::Insert { id: msg_id })));
 
         let get_reqs = input
             .entries()
             .filter_map(q!(|(client_id, op)| match op {
                 Op::Get { id: msg_id, key } => Some((key, (client_id, msg_id))),
                 _ => None,
-            }));
+            }))
+            .atomic(&tick)
+            .batch(nondet!(/** batch get requests */));
 
         let get_resp = get_reqs.clone()
-            .batch(&tick, nondet!(/** batch get requests */))
             .join(result_keyed)
             .map(q!(|(_key, ((client_id, id), ztuple))| ((client_id, id), ztuple)))
             .into_keyed()
@@ -581,7 +585,6 @@ mod tests {
             .map(q!(|((client_id, id), vtup)| ((client_id, id), Some(vtup))));
 
         let missing_resp = get_reqs.clone()
-            .batch(&tick, nondet!(/** batch get requests */)) // XXX need Atomic to ensure these are aligned?
             .map(q!(|(_key, (client_id, id))| ((client_id, id), None)))
             .chain(get_resp)
             .into_keyed()
@@ -599,10 +602,9 @@ mod tests {
             .map(q!(|((client_id, id), vtups)| (client_id, OpResponse::Get {
                 id,
                 tuples: vtups,
-            })))
-            .into_keyed()
-            .all_ticks();
+            })));
 
+        // Chain unkeyed streams then convert to keyed after collecting all ticks.
         let responses = insert_responses
             .chain(missing_resp)
             .all_ticks()
@@ -656,7 +658,5 @@ mod tests {
         assert_eq!(responses.len(), 4);
         assert!(chk_get(4, responses, Some(
             vec![ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 4 }, count: 1 }])));
-
-        tokio::signal::ctrl_c().await.unwrap();
     }
 }
