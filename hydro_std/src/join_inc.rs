@@ -260,8 +260,6 @@ mod tests {
         }
     }
 
-    // Helper to check a Get response (by id) against an expected optional multiset of ZTuples.
-    // Returns true if a matching response with correct contents was found; false otherwise.
     fn chk_get(qid: u32, responses: Vec<OpResponse>, expected: Option<Vec<ZTuple>>) -> bool {
         responses
             .iter()
@@ -520,30 +518,95 @@ mod tests {
         let (in_port, input, _membership, complete_sink) =
             process_node.bidi_external_many_bincode(&external);
 
+        // (u64, Op) -> ((u64, u32), ZTuple) 
+        let insert_input = input.clone()
+            .entries()
+            .filter_map(q!(|(client_id, op)| match op {
+                Op::Insert { id: msg_id, tuple } => Some(((client_id, msg_id), tuple)),
+                _ => None,
+            }));
+
+        let r_stream = insert_input.clone()
+            .filter_map(q!(|(_, ztuple)| match ztuple.tuple {
+                RawTuple::R { a, b } => Some((a, (b, ztuple.count))),
+                _ => None,
+            }));
+        let s_stream = insert_input.clone()
+            .filter_map(q!(|(_, ztuple)| match ztuple.tuple {
+                RawTuple::S { a, c, d } => Some((a, (c, d, ztuple.count))),
+                _ => None,
+            }));
+        // join R, S -> ((a, b, c, d), count)
+        let delta_r_x_s = r_stream.join(s_stream)
+            .map(q!(|(a, ((b, r_count), (c, d, s_count)))| ((a, b, c, d), r_count * s_count)))
+            .into_keyed()
+            .fold_commutative(
+                q!(|| 0i32),
+                q!(|acc, count| *acc += count)
+            )
+            .filter(q!(|count| *count != 0));
 
         let tick = process_node.tick();
-        // .atomic(..) to process in batches? Do we need to specify
-        // this for the straight-join version?
-        let (r_stream, s_stream) = demux_rs(input.atomic(&tick));
-        let s_stream =
-            s_stream.entries();
-        let s_stream = s_stream
-            .map(q!(|((a, c, d), s_count)| (a, (c, d, s_count))))
-            .inspect(q!(|(a, (c, d, s_count))| {
-                println!("S stream: ({}, {}, {})#{}", a, c, d, s_count);
+        let r_x_s = delta_r_x_s.snapshot(&tick, nondet!(/** rollup join result */));
+        let result_keyed = r_x_s.clone()
+            .entries()
+            .map(q!(|((a, b, c, d), count)| (a, ZTuple {
+                tuple: RawTuple::T { a, b, c, d },
+                count,
+            })));
+
+        // TODO: how to ACK after the insert applies to the join... but not make
+        // it part of the join state?
+        let insert_responses = insert_input
+            .map(q!(|((client_id, msg_id), _)| (client_id, OpResponse::Insert { id: msg_id })))
+            .into_keyed();
+
+        let get_reqs = input
+            .entries()
+            .filter_map(q!(|(client_id, op)| match op {
+                Op::Get { id: msg_id, key } => Some((key, (client_id, msg_id))),
+                _ => None,
             }));
-        let r_stream = r_stream
-            .clone()
-            .entries();
-        let r_stream = r_stream.map(q!(|((a, b), r_count)| (a, (b, r_count))))
-            .inspect(q!(|(a, (b, r_count))| {
-                println!("R stream: ({}, {})#{}", a, b, r_count);
-            }));
-        let responses = r_stream.join(s_stream).end_atomic()
-            .map(q!(|x| (0u64, x)))
-            .inspect(q!(|(id, (a, ((b, r_count), (c, d, s_count))))| {
-                println!("response: id={:?} ({:?}, {:?}, {:?}, {:?})#{:?}", id, a, b, c, d, r_count * s_count);
-            })).into_keyed();
+
+        let get_resp = get_reqs.clone()
+            .batch(&tick, nondet!(/** batch get requests */))
+            .join(result_keyed)
+            .map(q!(|(_key, ((client_id, id), ztuple))| ((client_id, id), ztuple)))
+            .into_keyed()
+            .fold_commutative(
+                q!(|| Vec::<ZTuple>::new()),
+                q!(|acc, zt| acc.push(zt))
+            )
+            .entries()
+            .map(q!(|((client_id, id), vtup)| ((client_id, id), Some(vtup))));
+
+        let missing_resp = get_reqs.clone()
+            .batch(&tick, nondet!(/** batch get requests */)) // XXX need Atomic to ensure these are aligned?
+            .map(q!(|(_key, (client_id, id))| ((client_id, id), None)))
+            .chain(get_resp)
+            .into_keyed()
+            .fold_commutative(
+                q!(|| None::<Vec<ZTuple>>),
+                q!(|acc, zt| {
+                    if let Some(v) = zt {
+                        if acc.replace(v).is_some() {
+                            panic!("expected at most one value from get_reqs");
+                        }
+                    }
+                })
+            )
+            .entries()
+            .map(q!(|((client_id, id), vtups)| (client_id, OpResponse::Get {
+                id,
+                tuples: vtups,
+            })))
+            .into_keyed()
+            .all_ticks();
+
+        let responses = insert_responses
+            .chain(missing_resp)
+            .all_ticks()
+            .into_keyed();
 
         complete_sink.complete(responses);
 
@@ -559,52 +622,40 @@ mod tests {
 
         deployment.start().await.unwrap();
 
-        // Test increment operation
-        external_in
-            .send(ZTuple {
-                tuple: RawTuple::R { a: 1, b: 2 },
-                count: 1,
-            })
-            .await
-            .unwrap();
-        external_in
-            .send(ZTuple {
-                    tuple: RawTuple::S { a: 1, c: 3, d: 4 },
-                    count: 1,
-                })
-            .await
-            .unwrap();
-        external_in
-            .send(ZTuple {
-                    tuple: RawTuple::S { a: 2, c: 5, d: 6 },
-                    count: 1,
-                })
-            .await
-            .unwrap();
+        let msg_id = Rc::new(RefCell::new(0u32));
+        let ins_r = {
+            let msg_id = Rc::clone(&msg_id);
+            move |(a, b), count| make_insert(&msg_id, RawTuple::R { a, b }, count)
+        };
+        let ins_s = {
+            let msg_id = Rc::clone(&msg_id);
+            move |(a, c, d), count| make_insert(&msg_id, RawTuple::S { a, c, d }, count)
+        };
+        let get_k = {
+            let msg_id = Rc::clone(&msg_id);
+            move |k| Op::Get {
+                id: {
+                    *msg_id.borrow_mut() += 1;
+                    *msg_id.borrow()
+                },
+                key: k,
+            }
+        };
 
+        // ΔR: (1, 2)
+        // ΔS: (1, 3, 4), (2, 5, 6)
+        // ΔT: (1, 2, 3, 4)#1
+        //  T: (1, 2, 3, 4)#1
+        external_in.send(ins_r((1, 2), 1)).await.unwrap();
+        external_in.send(ins_s((1, 3, 4), 1)).await.unwrap();
+        external_in.send(ins_s((2, 5, 6), 1)).await.unwrap();
+        external_in.send(get_k(1)).await.unwrap(); // id 4
 
-        external_in
-            .send(ZTuple {
-                    tuple: RawTuple::S { a: 1, c: 3, d: 5 },
-                    count: 1,
-                })
-            .await
-            .unwrap();
-
-        external_in
-            .send(ZTuple {
-                    tuple: RawTuple::R { a: 1, b: 2 },
-                    count: -1,
-                })
-            .await
-            .unwrap();
-        external_in
-            .send(ZTuple {
-                    tuple: RawTuple::R { a: 1, b: 7 },
-                    count: 2,
-                })
-            .await
-            .unwrap();
+        let responses: Vec<_> = external_out.by_ref().take(4).collect().await;
+        dbg!(&responses);
+        assert_eq!(responses.len(), 4);
+        assert!(chk_get(4, responses, Some(
+            vec![ZTuple { tuple: RawTuple::T { a: 1, b: 2, c: 3, d: 4 }, count: 1 }])));
 
         tokio::signal::ctrl_c().await.unwrap();
     }
