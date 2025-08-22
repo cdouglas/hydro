@@ -38,8 +38,6 @@ pub enum OpResponse {
     },
 }
 
-
-
 pub fn inc_join<'a, L: Location<'a> + NoTick + NoAtomic, Order>(
     ops: KeyedStream<u64, Op, Atomic<L>, Unbounded, Order>,
 ) -> (
