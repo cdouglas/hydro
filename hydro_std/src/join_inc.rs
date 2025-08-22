@@ -38,32 +38,7 @@ pub enum OpResponse {
     },
 }
 
-pub fn demux_rs<'a, L: Location<'a> + NoTick + NoAtomic, Order>(
-    stream: KeyedStream<u64, ZTuple, Atomic<L>, Unbounded, Order>,
-) -> (
-    KeyedStream<(u32, u32), i32, Atomic<L>, Unbounded, NoOrder>,
-    KeyedStream<(u32, u32, u32), i32, Atomic<L>, Unbounded, NoOrder>,
-) {
-    let r_stream = stream
-        .clone()
-        .values()
-        .filter_map(q!(|ztuple| match ztuple.tuple {
-            RawTuple::R { a, b } => Some(((a, b), ztuple.count)),
-            _ => None,
-        }))
-        .into_keyed();
 
-    let s_stream = stream
-        .clone()
-        .values()
-        .filter_map(q!(|ztuple| match ztuple.tuple {
-            RawTuple::S { a, c, d } => Some(((a, c, d), ztuple.count)),
-            _ => None,
-        }))
-        .into_keyed();
-
-    (r_stream, s_stream)
-}
 
 pub fn inc_join<'a, L: Location<'a> + NoTick + NoAtomic, Order>(
     ops: KeyedStream<u64, Op, Atomic<L>, Unbounded, Order>,
@@ -72,10 +47,31 @@ pub fn inc_join<'a, L: Location<'a> + NoTick + NoAtomic, Order>(
     KeyedStream<u64, String, L, Unbounded, NoOrder>,
 ) {
     // KeyedStream is Atomic; snapshot and batch are aligned
-    let (r_stream, s_stream) = demux_rs(ops.clone().filter_map(q!(|op| match op {
-        Op::Insert { tuple, .. } => Some(tuple),
-        Op::Get { .. } => None,
-    })));
+    let (r_stream, s_stream) = {
+        let stream = ops.clone().filter_map(q!(|op| match op {
+            Op::Insert { tuple, .. } => Some(tuple),
+            Op::Get { .. } => None,
+        }));
+        let r_stream = stream
+            .clone()
+            .values()
+            .filter_map(q!(|ztuple| match ztuple.tuple {
+                RawTuple::R { a, b } => Some(((a, b), ztuple.count)),
+                _ => None,
+            }))
+            .into_keyed();
+
+        let s_stream = stream
+            .clone()
+            .values()
+            .filter_map(q!(|ztuple| match ztuple.tuple {
+                RawTuple::S { a, c, d } => Some(((a, c, d), ztuple.count)),
+                _ => None,
+            }))
+            .into_keyed();
+
+        (r_stream, s_stream)
+    };
     let ops_batch = ops.batch(nondet!(/** group of commands */));
 
     // R relation
@@ -671,10 +667,10 @@ mod tests {
         let external_r = flow.external::<()>();
         let external_s = flow.external::<()>();
 
-        let (r_port, r_stream_in, _membership, complete_sink) =
-            process_node.bidi_external_many_bincode(&external_r);
-        let (s_port, s_stream_in, _membership, complete_sink) =
-            process_node.bidi_external_many_bincode(&external_s);
+        let (r_port, r_stream_in, _r_membership, r_complete_sink) =
+            process_node.bidi_external_many_bincode::<(), ZTuple, ()>(&external_r);
+        let (s_port, s_stream_in, _s_membership, s_complete_sink) =
+            process_node.bidi_external_many_bincode::<(), ZTuple, ()>(&external_s);
         let tick = process_node.tick();
 
         let nodes = flow
@@ -685,10 +681,15 @@ mod tests {
 
         deployment.deploy().await.unwrap();
 
-        let (mut external_out, mut r_external_in) = nodes.connect_bincode(r_port).await;
-        let (mut external_out, mut s_external_in) = nodes.connect_bincode(s_port).await;
+        let (mut _external_out, mut r_external_in) = nodes.connect_bincode(r_port).await;
+        let (mut _external_out, mut s_external_in) = nodes.connect_bincode(s_port).await;
 
         deployment.start().await.unwrap();
+
+        let rtf = r_stream_in.clone().map(q!(|_| ()));
+        let stf = s_stream_in.clone().map(q!(|_| ()));
+        r_complete_sink.complete(rtf);
+        s_complete_sink.complete(stf);
 
         // THE FOLLOWING FLOW SHOULD BE A DROP-IN REPLACEMENT for `join` over ZTuples
         // The "API" should just be streams of (k, v) on both sides (which it's not yet)
@@ -706,6 +707,7 @@ mod tests {
                 _ => None,
             }));
 
+
         // inductively put the deltas in old at *end of tick*
         // r_old_next = Z-set-merge(r_old, r_delta)
         // r_old = r_old_next.defer_tick();
@@ -716,25 +718,27 @@ mod tests {
             .atomic(&tick)
             .batch(nondet!(/** form a batch for incremental processing **/));
         let r_old = r_delta
+            .clone()
             .map(q!(|(a, (b, cnt))| ((a, b), cnt)))
             .defer_tick()
             .into_keyed()
             .fold_commutative(q!(|| 0i32), q!(|acc, count| *acc += count))
             .entries() // ((a, b), cnt)
             .map(q!(|((a, b), cnt)| (a, b, cnt)))
-            .filter(q!(|(a, b, cnt)| *cnt != 0));
+            .filter(q!(|(_a, _b, cnt)| *cnt != 0));
         let s_old = s_delta
+            .clone()
             .map(q!(|(a, (c, d, cnt))| ((a, c, d), cnt)))
             .defer_tick()
             .into_keyed()
             .fold_commutative(q!(|| 0i32), q!(|acc, count| *acc += count))
             .entries() // ((a, b), cnt)
             .map(q!(|((a, c, d), cnt)| (a, c, d, cnt)))
-            .filter(q!(|(a, c, d, cnt)| *cnt != 0));
+            .filter(q!(|(_a, _c, _d, cnt)| *cnt != 0));
 
         // join deltas against the current versions of old
-        let r_d_x_s = r_delta.join(s_old.map(q!(|(a, c, d, cnt)| (a, (c, d, cnt)))));
-        let r_x_s_d = r_old.map(q!(|(a, b, cnt)| (a, (b, cnt)))).join(s_delta);
+        let r_d_x_s = r_delta.clone().join(s_old.map(q!(|(a, c, d, cnt)| (a, (c, d, cnt)))));
+        let r_x_s_d = r_old.map(q!(|(a, b, cnt)| (a, (b, cnt)))).join(s_delta.clone());
         // and join the deltas
         let r_d_x_s_d = r_delta.join(s_delta);
 
@@ -778,6 +782,8 @@ mod tests {
             .unwrap();
 
         output.inspect(q!(|t| println!("output tup: {:?}", t)));
+
+        tokio::signal::ctrl_c().await.unwrap();
     }
 
     #[tokio::test]
