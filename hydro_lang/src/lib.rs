@@ -60,7 +60,7 @@ pub mod cycle;
 pub mod builder;
 pub use builder::FlowBuilder;
 
-mod manual_expr;
+pub mod manual_expr;
 
 pub mod ir;
 

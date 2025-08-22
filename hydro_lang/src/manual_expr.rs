@@ -6,7 +6,7 @@ use stageleft::runtime_support::{FreeVariableWithContext, QuoteTokens};
 
 /// Utility for wrapping a quoted expression with a custom transformation, such as explicitly
 /// splicing it with a type hint.
-pub(crate) struct ManualExpr<T, F> {
+pub struct ManualExpr<T, F> {
     fun: F,
     _phantom: PhantomData<T>,
 }
