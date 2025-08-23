@@ -45,7 +45,7 @@ pub fn dbsp_batch_join<'a, R, S, T, K, KR, KS, M, L, O>(
         .filter(q!(|count| *count != 0))
         .snapshot(nondet!(/** rollup R state */))
         .entries()
-        .map(q!(|(tuple, count)| ZTuple { tuple, count })) // XXX this seems wildly inefficient
+        .map(q!(|(tuple, count)| ZTuple { tuple, count }))
         .defer_tick();
     let s = s_stream.clone()
         .map(q!(|ztuple| (ztuple.tuple, ztuple.count)))
@@ -64,26 +64,21 @@ pub fn dbsp_batch_join<'a, R, S, T, K, KR, KS, M, L, O>(
         .map(q!(|ztuple| (ztuple.tuple, ztuple.count)))
         .batch(nondet!(/** S tuples this tick */));
 
-    // TODO: join on KeyedStream not complete, yet
     let r_kstream = r.clone()
-        .map(q!(move |ztuple| (r_key_quot(&ztuple.tuple), ztuple)))
-        .into_keyed();
+        .map(q!(move |ztuple| (r_key_quot(&ztuple.tuple), ztuple)));
     let s_kstream = s.clone()
-        .map(q!(move |ztuple| (s_key_quot(&ztuple.tuple), ztuple)))
-        .into_keyed();
+        .map(q!(move |ztuple| (s_key_quot(&ztuple.tuple), ztuple)));
     let dr_kstream = delta_r
-        .map(q!(move |(tuple, count)| (r_key_quot(&tuple), ZTuple { tuple, count })))
-        .into_keyed();
+        .map(q!(move |(tuple, count)| (r_key_quot(&tuple), ZTuple { tuple, count })));
     let ds_kstream = delta_s
-        .map(q!(move |(tuple, count)| (s_key_quot(&tuple), ZTuple { tuple, count })))
-        .into_keyed();
+        .map(q!(move |(tuple, count)| (s_key_quot(&tuple), ZTuple { tuple, count })));
 
     // ΔR x ΔS
-    let dr_x_ds = dr_kstream.clone().entries().join(ds_kstream.clone().entries());
+    let dr_x_ds = dr_kstream.clone().join(ds_kstream.clone());
     //  R x ΔS
-    let r_x_ds = r_kstream.entries().join(ds_kstream.entries());
+    let r_x_ds = r_kstream.join(ds_kstream);
     // ΔR x  S
-    let dr_x_s = dr_kstream.entries().join(s_kstream.entries());
+    let dr_x_s = dr_kstream.join(s_kstream);
 
     let join_result = dr_x_ds.chain(r_x_ds).chain(dr_x_s)
         .map(q!(move |(_key, (ztuple_r, ztuple_s))| {
@@ -108,25 +103,13 @@ mod tests {
     use futures::{SinkExt, StreamExt};
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-    struct RawTupleR {
-        a: u32,
-        b: u32,
-    }
+    struct RawTupleR { a: u32, b: u32, }
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-    struct RawTupleS {
-        a: u32,
-        c: u32,
-        d: u32,
-    }
+    struct RawTupleS { a: u32, c: u32, d: u32, }
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-    struct RawTupleT {
-        a: u32,
-        b: u32,
-        c: u32,
-        d: u32,
-    }
+    struct RawTupleT { a: u32, b: u32, c: u32, d: u32, }
 
     #[tokio::test]
     async fn test_batch_join_basic() {
@@ -158,7 +141,6 @@ mod tests {
 
         let t_recv = responses.send_bincode_external(&external);
 
-        // Oh! This needs to follow defn of t_recv?
         let nodes = flow
             .with_process(&process_node, deployment.Localhost())
             .with_external(&external, deployment.Localhost())
@@ -176,9 +158,6 @@ mod tests {
         s_external_in.send(ZTuple { tuple: RawTupleS { a: 1, c: 20, d: 30 }, count: 1 }).await.unwrap();
 
         let recv = t_external_out.take(1).collect::<Vec<_>>().await;
-        dbg!(&recv);
-        for r in recv {
-            assert_eq!(r.tuple, RawTupleT { a: 1, b: 10, c: 20, d: 30 });
-        }
+        assert_eq!(recv[0], ZTuple { tuple: RawTupleT { a: 1, b: 10, c: 20, d: 30 }, count: 1 });
     }
 }
