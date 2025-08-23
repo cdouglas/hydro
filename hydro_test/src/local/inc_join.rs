@@ -116,37 +116,20 @@ mod tests {
 
         let flow = FlowBuilder::new();
         let process_node = flow.process::<()>();
-        let external_r = flow.external::<()>();
-        let external_s = flow.external::<()>();
-        let external_out = flow.external::<()>();
+        let external = flow.external::<()>();
 
-        let (r_port, r_stream_in, _r_membership, _r_complete_sink) =
-            process_node.bidi_external_many_bincode::<(), ZTuple<(u32, u32)>, ()>(&external_r);
-        let (s_port, s_stream_in, _s_membership, _s_complete_sink) =
-            process_node.bidi_external_many_bincode::<(), ZTuple<(u32, u32, u32)>, ()>(&external_s);
-        let (out_port, _out_stream, _out_membership, out_complete_sink) =
-            process_node.bidi_external_many_bincode::<(), (), ZTuple<(u32, u32, u32, u32)>>(&external_out);
+        let (r_send, r_stream) = process_node.source_external_bincode(&external);
+        let (s_send, s_stream) = process_node.source_external_bincode(&external);
 
         let nodes = flow
             .with_process(&process_node, deployment.Localhost())
-            .with_external(&external_r, deployment.Localhost())
-            .with_external(&external_s, deployment.Localhost())
-            .with_external(&external_out, deployment.Localhost())
+            .with_external(&external, deployment.Localhost())
             .deploy(&mut deployment);
-
-
-        deployment.deploy().await.unwrap();
-
-        let (_r_external_out, mut r_external_in) = nodes.connect_bincode(r_port).await;
-        let (_s_external_out, mut s_external_in) = nodes.connect_bincode(s_port).await;
-        let (mut out_external_out, _out_external_in) = nodes.connect_bincode(out_port).await;
-
-        deployment.start().await.unwrap();
 
         let tick = process_node.tick();
         let (responses, _errors) = dbsp_batch_join(
-            r_stream_in.values().atomic(&tick),
-            s_stream_in.values().atomic(&tick),
+            r_stream.atomic(&tick),
+            s_stream.atomic(&tick),
             q!(|(a, _b): &(u32, u32)| *a),
             q!(|(a, _c, _d): &(u32, u32, u32)| *a),
             q!(|&(a_r, b), &(a_s, c, d)| {
@@ -158,14 +141,25 @@ mod tests {
             })
         );
 
-        out_complete_sink.complete(responses.map(q!(|z| (0, z))).into_keyed());
+        let t_recv = responses.send_bincode_external(&external);
+
+        deployment.deploy().await.unwrap();
+
+        let mut r_external_in = nodes.connect_sink_bincode(r_send).await;
+        let mut s_external_in = nodes.connect_sink_bincode(s_send).await;
+        let t_external_out = nodes.connect_source_bincode(t_recv).await;
+
+        deployment.start().await.unwrap();
 
         // Send test data
         r_external_in.send(ZTuple { tuple: (1, 10), count: 1 }).await.unwrap();
         s_external_in.send(ZTuple { tuple: (1, 20, 30), count: 1 }).await.unwrap();
 
         // Receive results
-        let recv = out_external_out.by_ref().take(1).collect::<Vec<_>>().await;
+        let recv = t_external_out.take(1).collect::<Vec<_>>().await;
         dbg!(&recv);
+        for r in recv {
+            assert_eq!(r.tuple, (1, 10, 20, 30));
+        }
     }
 }
