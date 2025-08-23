@@ -34,9 +34,9 @@ pub fn dbsp_batch_join<'a, R, S, T, K, KR, KS, M, L, O>(
           M: Fn(&R, &S) -> T + 'a,
           L: Location<'a> + NoTick + NoAtomic
 {
-    let r_key_quot: ManualExpr<KR, _> = ManualExpr::new(move |ctx: &Tick<L>| r_key.splice_fn1_ctx(ctx));
-    let s_key_quot: ManualExpr<KS, _> = ManualExpr::new(move |ctx: &Tick<L>| s_key.splice_fn1_ctx(ctx));
-    let merge_quot: ManualExpr<M, _> = ManualExpr::new(move |ctx: &Tick<L>| merge.splice_fn2_ctx(ctx));
+    let r_key_quot: ManualExpr<KR, _> = ManualExpr::new(move |ctx: &Tick<L>| r_key.splice_fn1_borrow_ctx(ctx));
+    let s_key_quot: ManualExpr<KS, _> = ManualExpr::new(move |ctx: &Tick<L>| s_key.splice_fn1_borrow_ctx(ctx));
+    let merge_quot: ManualExpr<M, _> = ManualExpr::new(move |ctx: &Tick<L>| merge.splice_fn2_borrow_ctx(ctx));
 
     let r = r_stream.clone()
         .map(q!(|ztuple| (ztuple.tuple, ztuple.count)))
@@ -107,6 +107,27 @@ mod tests {
     use super::*;
     use futures::{SinkExt, StreamExt};
 
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    struct RawTupleR {
+        a: u32,
+        b: u32,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    struct RawTupleS {
+        a: u32,
+        c: u32,
+        d: u32,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    struct RawTupleT {
+        a: u32,
+        b: u32,
+        c: u32,
+        d: u32,
+    }
+
     #[tokio::test]
     async fn test_batch_join_basic() {
         use hydro_deploy::Deployment;
@@ -125,21 +146,19 @@ mod tests {
         let (responses, _errors) = dbsp_batch_join(
             r_stream.atomic(&tick),
             s_stream.atomic(&tick),
-            q!(|(a, _b): &(u32, u32)| *a),
-            q!(|(a, _c, _d): &(u32, u32, u32)| *a),
-            q!(|&(a_r, b), &(a_s, c, d)| {
-                if a_r != a_s {
-                    panic!("{:?} != {:?}", a_r, a_s)
-                } else {
-                    (a_r, b, c, d)
+            q!(|r: &RawTupleR| r.a),
+            q!(|s: &RawTupleS| s.a),
+            q!(|r: &RawTupleR, s: &RawTupleS| {
+                if r.a != s.a {
+                    panic!("{:?} != {:?}", r.a, s.a)
                 }
+                RawTupleT { a: r.a, b: r.b, c: s.c, d: s.d }
             })
         );
 
         let t_recv = responses.send_bincode_external(&external);
 
         // Oh! This needs to follow defn of t_recv?
-        // XXX still doesn't work. cargo-culted change to stageleft probably responsible?
         let nodes = flow
             .with_process(&process_node, deployment.Localhost())
             .with_external(&external, deployment.Localhost())
@@ -153,15 +172,13 @@ mod tests {
 
         deployment.start().await.unwrap();
 
-        // Send test data
-        r_external_in.send(ZTuple { tuple: (1, 10), count: 1 }).await.unwrap();
-        s_external_in.send(ZTuple { tuple: (1, 20, 30), count: 1 }).await.unwrap();
+        r_external_in.send(ZTuple { tuple: RawTupleR { a: 1, b: 10 }, count: 1 }).await.unwrap();
+        s_external_in.send(ZTuple { tuple: RawTupleS { a: 1, c: 20, d: 30 }, count: 1 }).await.unwrap();
 
-        // Receive results
         let recv = t_external_out.take(1).collect::<Vec<_>>().await;
         dbg!(&recv);
         for r in recv {
-            assert_eq!(r.tuple, (1, 10, 20, 30));
+            assert_eq!(r.tuple, RawTupleT { a: 1, b: 10, c: 20, d: 30 });
         }
     }
 }
