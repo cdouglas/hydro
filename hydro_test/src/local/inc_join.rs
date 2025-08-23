@@ -66,16 +66,16 @@ pub fn dbsp_batch_join<'a, R, S, T, K, KR, KS, M, L, O>(
 
     // TODO: join on KeyedStream not complete, yet
     let r_kstream = r.clone()
-        .map(q!(move |ztuple: ZTuple<R>| (r_key_quot(&ztuple.tuple), ztuple)))
+        .map(q!(move |ztuple| (r_key_quot(&ztuple.tuple), ztuple)))
         .into_keyed();
     let s_kstream = s.clone()
-        .map(q!(move |ztuple: ZTuple<S>| (s_key_quot(&ztuple.tuple), ztuple)))
+        .map(q!(move |ztuple| (s_key_quot(&ztuple.tuple), ztuple)))
         .into_keyed();
     let dr_kstream = delta_r
-        .map(q!(move |(tuple, count): (R, i32)| (r_key_quot(&tuple), ZTuple { tuple, count })))
+        .map(q!(move |(tuple, count)| (r_key_quot(&tuple), ZTuple { tuple, count })))
         .into_keyed();
     let ds_kstream = delta_s
-        .map(q!(move |(tuple, count): (S, i32)| (s_key_quot(&tuple), ZTuple { tuple, count })))
+        .map(q!(move |(tuple, count)| (s_key_quot(&tuple), ZTuple { tuple, count })))
         .into_keyed();
 
     // ΔR x ΔS
@@ -86,7 +86,7 @@ pub fn dbsp_batch_join<'a, R, S, T, K, KR, KS, M, L, O>(
     let dr_x_s = dr_kstream.entries().join(s_kstream.entries());
 
     let join_result = dr_x_ds.chain(r_x_ds).chain(dr_x_s)
-        .map(q!(move |(_key, (ztuple_r, ztuple_s)): (K, (ZTuple<R>, ZTuple<S>))| {
+        .map(q!(move |(_key, (ztuple_r, ztuple_s))| {
             let merged = merge_quot(&ztuple_r.tuple, &ztuple_s.tuple);
             let count = ztuple_r.count * ztuple_s.count;
             (merged, count)
