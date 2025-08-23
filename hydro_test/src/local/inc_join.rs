@@ -121,11 +121,6 @@ mod tests {
         let (r_send, r_stream) = process_node.source_external_bincode(&external);
         let (s_send, s_stream) = process_node.source_external_bincode(&external);
 
-        let nodes = flow
-            .with_process(&process_node, deployment.Localhost())
-            .with_external(&external, deployment.Localhost())
-            .deploy(&mut deployment);
-
         let tick = process_node.tick();
         let (responses, _errors) = dbsp_batch_join(
             r_stream.atomic(&tick),
@@ -142,6 +137,13 @@ mod tests {
         );
 
         let t_recv = responses.send_bincode_external(&external);
+
+        // Oh! This needs to follow defn of t_recv?
+        // XXX still doesn't work. cargo-culted change to stageleft probably responsible?
+        let nodes = flow
+            .with_process(&process_node, deployment.Localhost())
+            .with_external(&external, deployment.Localhost())
+            .deploy(&mut deployment);
 
         deployment.deploy().await.unwrap();
 
