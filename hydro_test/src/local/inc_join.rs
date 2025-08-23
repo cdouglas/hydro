@@ -150,14 +150,39 @@ mod tests {
 
         let mut r_external_in = nodes.connect_sink_bincode(r_send).await;
         let mut s_external_in = nodes.connect_sink_bincode(s_send).await;
-        let t_external_out = nodes.connect_source_bincode(t_recv).await;
+        let mut t_external_out = nodes.connect_source_bincode(t_recv).await;
 
         deployment.start().await.unwrap();
 
+        //  R:           |  S:
+        // ΔR: (1, 10)#1 | ΔS: (1, 20, 30)#1
+        // ΔT: (1, 10, 20, 30)#1
         r_external_in.send(ZTuple { tuple: RawTupleR { a: 1, b: 10 }, count: 1 }).await.unwrap();
         s_external_in.send(ZTuple { tuple: RawTupleS { a: 1, c: 20, d: 30 }, count: 1 }).await.unwrap();
-
-        let recv = t_external_out.take(1).collect::<Vec<_>>().await;
+        let recv = t_external_out.by_ref().take(1).collect::<Vec<_>>().await;
         assert_eq!(recv[0], ZTuple { tuple: RawTupleT { a: 1, b: 10, c: 20, d: 30 }, count: 1 });
+
+        //  R: (1, 10)#1 |  S: (1, 20, 30)#1
+        // ΔR: (1, 10)#1 | ΔS:
+        // ΔT: (1, 10, 20, 30)#1
+        r_external_in.send(ZTuple { tuple: RawTupleR { a: 1, b: 10 }, count: 1 }).await.unwrap();
+        let recv = t_external_out.by_ref().take(1).collect::<Vec<_>>().await;
+        assert_eq!(recv[0], ZTuple { tuple: RawTupleT { a: 1, b: 10, c: 20, d: 30 }, count: 1 });
+
+        //  R: (1, 10)#2 |  S: (1, 20, 30)#1
+        // ΔR:           | ΔS: (1, 20, 30)#-1
+        // ΔT: (1, 10, 20, 30)#-2
+        s_external_in.send(ZTuple { tuple: RawTupleS { a: 1, c: 20, d: 30 }, count: -1 }).await.unwrap();
+        let recv = t_external_out.by_ref().take(1).collect::<Vec<_>>().await;
+        assert_eq!(recv[0], ZTuple { tuple: RawTupleT { a: 1, b: 10, c: 20, d: 30 }, count: -2 });
+
+        //  R: (1, 10)#2 |  S:
+        // ΔR: (1, 10)#1 | ΔS: (1, 40, 50)#2, (2, 20, 30)#1
+        // ΔT: (1, 10, 40, 50)#6
+        r_external_in.send(ZTuple { tuple: RawTupleR { a: 1, b: 10 }, count: 1 }).await.unwrap();
+        s_external_in.send(ZTuple { tuple: RawTupleS { a: 2, c: 20, d: 30 }, count: 1 }).await.unwrap();
+        s_external_in.send(ZTuple { tuple: RawTupleS { a: 1, c: 40, d: 50 }, count: 2 }).await.unwrap();
+        let recv = t_external_out.by_ref().take(1).collect::<Vec<_>>().await;
+        assert_eq!(recv[0], ZTuple { tuple: RawTupleT { a: 1, b: 10, c: 40, d: 50 }, count: 6 });
     }
 }
