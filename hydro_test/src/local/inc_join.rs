@@ -15,9 +15,57 @@ pub struct ZTuple<T> where T: Debug + Clone + Eq + Hash {
     pub count: i32,
 }
 
+pub fn streaming_join<'a, R, S, T, K, KR, KS, M, L, O>(
+    r_stream: Stream<ZTuple<R>, L, Unbounded, O>,
+    s_stream: Stream<ZTuple<S>, L, Unbounded, O>,
+    tick: Tick<L>,
+    r_key: impl IntoQuotedMut<'a, KR, L> + Copy,
+    s_key: impl IntoQuotedMut<'a, KS, L> + Copy,
+    merge: impl IntoQuotedMut<'a, M, L> + Copy
+) -> (
+    Stream<ZTuple<T>, L, Unbounded, NoOrder>,
+    () // Stream<String, L, Unbounded, NoOrder>, // err
+)
+    where R: Debug + Clone + Eq + Hash,
+          S: Debug + Clone + Eq + Hash,
+          T: Debug + Clone + Eq + Hash,
+          K: Debug + Clone + PartialEq + Eq + Hash,
+          KR: Fn(&R) -> K + 'a,
+          KS: Fn(&S) -> K + 'a,
+          M: Fn(&R, &S) -> T + 'a,
+          L: Location<'a> + NoTick + NoAtomic
+{
+    let r_key_quot: ManualExpr<KR, _> = ManualExpr::new(move |ctx: &L| r_key.splice_fn1_borrow_ctx(ctx));
+    let s_key_quot: ManualExpr<KS, _> = ManualExpr::new(move |ctx: &L| s_key.splice_fn1_borrow_ctx(ctx));
+    let merge_quot: ManualExpr<M, _> = ManualExpr::new(move |ctx: &L| merge.splice_fn2_borrow_ctx(ctx));
+
+    let dr_kstream = r_stream
+        .map(q!(move |ztuple| (r_key_quot(&ztuple.tuple), ZTuple { tuple: ztuple.tuple, count: ztuple.count })));
+    let ds_kstream = s_stream
+        .map(q!(move |ztuple| (s_key_quot(&ztuple.tuple), ZTuple { tuple: ztuple.tuple, count: ztuple.count })));
+
+    let join_result = dr_kstream.join(ds_kstream)
+        .map(q!(move |(_key, (ztuple_r, ztuple_s))| {
+            let merged = merge_quot(&ztuple_r.tuple, &ztuple_s.tuple);
+            let count = ztuple_r.count * ztuple_s.count;
+            (merged, count)
+        }))
+        .batch(&tick, nondet!(/** necessary for KeyedSingleton */))
+        .into_keyed()
+        .fold_commutative(q!(|| 0i32), q!(|acc, count| *acc += count))
+        .filter(q!(|count| *count != 0))
+        .entries()
+        .map(q!(|(tuple, count)| {
+            ZTuple { tuple, count }
+        }))
+        .all_ticks();
+    (join_result, ())
+}
+
 pub fn dbsp_batch_join<'a, R, S, T, K, KR, KS, M, L, O>(
-    r_stream: Stream<ZTuple<R>, Atomic<L>, Unbounded, O>,
-    s_stream: Stream<ZTuple<S>, Atomic<L>, Unbounded, O>,
+    r_stream: Stream<ZTuple<R>, L, Unbounded, O>,
+    s_stream: Stream<ZTuple<S>, L, Unbounded, O>,
+    tick: Tick<L>,
     r_key: impl IntoQuotedMut<'a, KR, Tick<L>> + Copy,
     s_key: impl IntoQuotedMut<'a, KS, Tick<L>> + Copy,
     merge: impl IntoQuotedMut<'a, M, Tick<L>> + Copy
@@ -37,6 +85,9 @@ pub fn dbsp_batch_join<'a, R, S, T, K, KR, KS, M, L, O>(
     let r_key_quot: ManualExpr<KR, _> = ManualExpr::new(move |ctx: &Tick<L>| r_key.splice_fn1_borrow_ctx(ctx));
     let s_key_quot: ManualExpr<KS, _> = ManualExpr::new(move |ctx: &Tick<L>| s_key.splice_fn1_borrow_ctx(ctx));
     let merge_quot: ManualExpr<M, _> = ManualExpr::new(move |ctx: &Tick<L>| merge.splice_fn2_borrow_ctx(ctx));
+
+    let r_stream = r_stream.atomic(&tick);
+    let s_stream = s_stream.atomic(&tick);
 
     let r = r_stream.clone()
         .map(q!(|ztuple| (ztuple.tuple, ztuple.count)))
@@ -126,9 +177,10 @@ mod tests {
         let (s_send, s_stream) = process_node.source_external_bincode(&external);
 
         let tick = process_node.tick();
-        let (responses, _errors) = dbsp_batch_join(
-            r_stream.atomic(&tick),
-            s_stream.atomic(&tick),
+        let (responses, _errors) = streaming_join(
+            r_stream,
+            s_stream,
+            tick,
             q!(|r: &RawTupleR| r.a),
             q!(|s: &RawTupleS| s.a),
             q!(|r: &RawTupleR, s: &RawTupleS| {
