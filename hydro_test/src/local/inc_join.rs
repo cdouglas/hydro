@@ -162,8 +162,14 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
     struct RawTupleT { a: u32, b: u32, c: u32, d: u32, }
 
-    #[tokio::test]
-    async fn test_batch_join_basic() {
+    async fn test_join_basic<F>(join_fn: F)
+    where
+        F: for<'a> Fn(
+            Stream<ZTuple<RawTupleR>, Process<'a>, Unbounded>,
+            Stream<ZTuple<RawTupleS>, Process<'a>, Unbounded>,
+            Tick<Process<'a>>,
+        ) -> (Stream<ZTuple<RawTupleT>, Process<'a>, Unbounded, NoOrder>, ()),
+    {
         use hydro_deploy::Deployment;
         use hydro_lang::FlowBuilder;
 
@@ -177,19 +183,9 @@ mod tests {
         let (s_send, s_stream) = process_node.source_external_bincode(&external);
 
         let tick = process_node.tick();
-        let (responses, _errors) = streaming_join(
-            r_stream,
-            s_stream,
-            tick,
-            q!(|r: &RawTupleR| r.a),
-            q!(|s: &RawTupleS| s.a),
-            q!(|r: &RawTupleR, s: &RawTupleS| {
-                if r.a != s.a {
-                    panic!("{:?} != {:?}", r.a, s.a)
-                }
-                RawTupleT { a: r.a, b: r.b, c: s.c, d: s.d }
-            })
-        );
+        
+        // JOIN invocation
+        let (responses, _errors) = join_fn(r_stream, s_stream, tick);
 
         let t_recv = responses.send_bincode_external(&external);
 
@@ -236,5 +232,53 @@ mod tests {
         s_external_in.send(ZTuple { tuple: RawTupleS { a: 1, c: 40, d: 50 }, count: 2 }).await.unwrap();
         let recv = t_external_out.by_ref().take(1).collect::<Vec<_>>().await;
         assert_eq!(recv[0], ZTuple { tuple: RawTupleT { a: 1, b: 10, c: 40, d: 50 }, count: 6 });
+    }
+
+    #[tokio::test]
+    async fn test_streaming_join_basic() {
+        fn streaming_join_wrapper<'a>(
+            r_stream: Stream<ZTuple<RawTupleR>, Process<'a>, Unbounded>,
+            s_stream: Stream<ZTuple<RawTupleS>, Process<'a>, Unbounded>,
+            tick: Tick<Process<'a>>,
+        ) -> (Stream<ZTuple<RawTupleT>, Process<'a>, Unbounded, NoOrder>, ()) {
+            streaming_join(
+                r_stream,
+                s_stream,
+                tick,
+                q!(|r: &RawTupleR| r.a),
+                q!(|s: &RawTupleS| s.a),
+                q!(|r: &RawTupleR, s: &RawTupleS| {
+                    if r.a != s.a {
+                        panic!("{:?} != {:?}", r.a, s.a)
+                    }
+                    RawTupleT { a: r.a, b: r.b, c: s.c, d: s.d }
+                })
+            )
+        }
+        test_join_basic(streaming_join_wrapper).await;
+    }
+
+    #[tokio::test]
+    async fn test_dbsp_batch_join_basic() {
+        fn dbsp_batch_join_wrapper<'a>(
+            r_stream: Stream<ZTuple<RawTupleR>, Process<'a>, Unbounded>,
+            s_stream: Stream<ZTuple<RawTupleS>, Process<'a>, Unbounded>,
+            tick: Tick<Process<'a>>,
+        ) -> (Stream<ZTuple<RawTupleT>, Process<'a>, Unbounded, NoOrder>, ()) {
+            dbsp_batch_join(
+                r_stream,
+                s_stream,
+                tick,
+                q!(|r: &RawTupleR| r.a),
+                q!(|s: &RawTupleS| s.a),
+                q!(|r: &RawTupleR, s: &RawTupleS| {
+                    if r.a != s.a {
+                        panic!("{:?} != {:?}", r.a, s.a)
+                    }
+                    RawTupleT { a: r.a, b: r.b, c: s.c, d: s.d }
+                })
+            )
+        }
+        test_join_basic(dbsp_batch_join_wrapper).await;
     }
 }
