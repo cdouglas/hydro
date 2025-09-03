@@ -24,10 +24,7 @@ pub fn streaming_join<'a, R, S, T, K, KR, KS, M, L, O>(
     r_key: impl IntoQuotedMut<'a, KR, L> + Copy,
     s_key: impl IntoQuotedMut<'a, KS, L> + Copy,
     merge: impl IntoQuotedMut<'a, M, L> + Copy,
-) -> (
-    Stream<ZTuple<T>, L, Unbounded, NoOrder>,
-    (), // Stream<String, L, Unbounded, NoOrder>, // err
-)
+) -> Stream<ZTuple<T>, L, Unbounded, NoOrder>
 where
     R: Debug + Clone + Eq + Hash,
     S: Debug + Clone + Eq + Hash,
@@ -38,6 +35,7 @@ where
     M: Fn(&R, &S) -> T + 'a,
     L: Location<'a> + NoTick + NoAtomic,
 {
+    // quote function ptr
     let r_key_quot: ManualExpr<KR, _> =
         ManualExpr::new(move |ctx: &L| r_key.splice_fn1_borrow_ctx(ctx));
     let s_key_quot: ManualExpr<KS, _> =
@@ -45,6 +43,7 @@ where
     let merge_quot: ManualExpr<M, _> =
         ManualExpr::new(move |ctx: &L| merge.splice_fn2_borrow_ctx(ctx));
 
+    // extract key from R, S
     let dr_kstream = r_stream.map(q!(move |ztuple| (
         r_key_quot(&ztuple.tuple),
         ZTuple {
@@ -60,6 +59,7 @@ where
         }
     )));
 
+    // join R, S
     let join_result = dr_kstream
         .join(ds_kstream)
         .map(q!(move |(_key, (ztuple_r, ztuple_s))| {
@@ -74,7 +74,7 @@ where
         .entries()
         .map(q!(|(tuple, count)| { ZTuple { tuple, count } }))
         .all_ticks();
-    (join_result, ())
+    join_result
 }
 
 pub fn dbsp_batch_join<'a, R, S, T, K, KR, KS, M, L, O>(
@@ -84,10 +84,7 @@ pub fn dbsp_batch_join<'a, R, S, T, K, KR, KS, M, L, O>(
     r_key: impl IntoQuotedMut<'a, KR, Tick<L>> + Copy,
     s_key: impl IntoQuotedMut<'a, KS, Tick<L>> + Copy,
     merge: impl IntoQuotedMut<'a, M, Tick<L>> + Copy,
-) -> (
-    Stream<ZTuple<T>, L, Unbounded, NoOrder>,
-    (), // Stream<String, L, Unbounded, NoOrder>, // err
-)
+) -> Stream<ZTuple<T>, L, Unbounded, NoOrder>
 where
     R: Debug + Clone + Eq + Hash,
     S: Debug + Clone + Eq + Hash,
@@ -174,7 +171,7 @@ where
         .entries()
         .map(q!(|(tuple, count)| { ZTuple { tuple, count } }))
         .all_ticks();
-    (join_result, ())
+    join_result
 }
 
 #[cfg(test)]
@@ -210,11 +207,7 @@ mod tests {
             Stream<ZTuple<RawTupleR>, Process<'a>, Unbounded>,
             Stream<ZTuple<RawTupleS>, Process<'a>, Unbounded>,
             Tick<Process<'a>>,
-        ) -> (
-            Stream<ZTuple<RawTupleT>, Process<'a>, Unbounded, NoOrder>,
-            (),
-        ),
-    {
+        ) -> Stream<ZTuple<RawTupleT>, Process<'a>, Unbounded, NoOrder> {
         use hydro_deploy::Deployment;
         use hydro_lang::FlowBuilder;
 
@@ -230,7 +223,7 @@ mod tests {
         let tick = process_node.tick();
 
         // JOIN invocation
-        let (responses, _errors) = join_fn(r_stream, s_stream, tick);
+        let responses = join_fn(r_stream, s_stream, tick);
 
         let t_recv = responses.send_bincode_external(&external);
 
@@ -371,10 +364,7 @@ mod tests {
             r_stream: Stream<ZTuple<RawTupleR>, Process<'a>, Unbounded>,
             s_stream: Stream<ZTuple<RawTupleS>, Process<'a>, Unbounded>,
             tick: Tick<Process<'a>>,
-        ) -> (
-            Stream<ZTuple<RawTupleT>, Process<'a>, Unbounded, NoOrder>,
-            (),
-        ) {
+        ) -> Stream<ZTuple<RawTupleT>, Process<'a>, Unbounded, NoOrder> {
             streaming_join(
                 r_stream,
                 s_stream,
@@ -403,10 +393,7 @@ mod tests {
             r_stream: Stream<ZTuple<RawTupleR>, Process<'a>, Unbounded>,
             s_stream: Stream<ZTuple<RawTupleS>, Process<'a>, Unbounded>,
             tick: Tick<Process<'a>>,
-        ) -> (
-            Stream<ZTuple<RawTupleT>, Process<'a>, Unbounded, NoOrder>,
-            (),
-        ) {
+        ) -> Stream<ZTuple<RawTupleT>, Process<'a>, Unbounded, NoOrder> {
             dbsp_batch_join(
                 r_stream,
                 s_stream,
@@ -427,5 +414,239 @@ mod tests {
             )
         }
         test_join_basic(dbsp_batch_join_wrapper).await;
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+    struct LogEntry<T>
+    where
+        T: Debug + Clone + Eq + Hash,
+    {
+        value: ZTuple<T>,
+        xid: u64,
+    }
+
+    #[tokio::test]
+    async fn test_log_write() {
+        use hydro_deploy::Deployment;
+        use hydro_lang::FlowBuilder;
+
+        let mut deployment = Deployment::new();
+
+        let flow = FlowBuilder::new();
+        let process_node = flow.process::<()>();
+        let external = flow.external::<()>();
+
+        let (r_send, r_stream) = process_node.source_external_bincode(&external);
+
+        let tick = process_node.tick();
+
+        let log = r_stream
+            .batch(&tick, nondet!(/** snapshot of log state */))
+            .persist()
+            .all_ticks();
+
+        let r_log = log.send_bincode_external(&external);
+
+        let nodes = flow
+            .with_process(&process_node, deployment.Localhost())
+            .with_external(&external, deployment.Localhost())
+            .deploy(&mut deployment);
+
+        deployment.deploy().await.unwrap();
+
+        let mut r_external_in = nodes.connect_sink_bincode(r_send).await;
+        let mut listener_stream = nodes.connect_source_bincode(r_log).await;
+
+        deployment.start().await.unwrap();
+
+        r_external_in
+            .send(LogEntry {
+                value: ZTuple {
+                    tuple: 42u32,
+                    count: 1,
+                },
+                xid: 1,
+            })
+            .await
+            .unwrap();
+
+        r_external_in
+            .send(LogEntry {
+                value: ZTuple {
+                    tuple: 42u32,
+                    count: 1,
+                },
+                xid: 2,
+            })
+            .await
+            .unwrap();
+
+        let tup = listener_stream
+            .by_ref()
+            .take(2)
+            .collect::<Vec<LogEntry<u32>>>()
+            .await;
+
+        assert_eq!(
+            vec![
+                LogEntry {
+                    value: ZTuple {
+                        tuple: 42u32,
+                        count: 1
+                    },
+                    xid: 1,
+                },
+                LogEntry {
+                    value: ZTuple {
+                        tuple: 42u32,
+                        count: 1
+                    },
+                    xid: 2,
+                },
+            ],
+            tup
+        );
+    }
+
+    #[tokio::test]
+    async fn test_log_write_read() {
+        use hydro_deploy::Deployment;
+        use hydro_lang::FlowBuilder;
+
+        let mut deployment = Deployment::new();
+
+        let flow = FlowBuilder::new();
+        let process_node = flow.process::<()>();
+        let external = flow.external::<()>();
+
+        let (r_send, r_stream) = process_node.source_external_bincode(&external);
+
+        let tick = process_node.tick();
+
+        // a stream of ZTuple insertions that came in a batch at a time
+        let log = r_stream
+            .batch(&tick, nondet!(/**  */))
+            .persist()
+            .all_ticks();
+
+        // a KeyedSingleton: i.e. a map of tuples to multiplicities
+        let log_replayed = log
+            .clone()
+            .map(q!(|entry: LogEntry<_>| (
+                entry.value.tuple,
+                entry.value.count
+            )))
+            .into_keyed()
+            .fold_commutative(q!(|| 0i32), q!(|acc, count| *acc += count));
+
+        // a snapshot of log_replayed at the end of this tick
+        let snapshot = log_replayed.snapshot(&tick, nondet!(/** **/)).entries();
+        // .defer_tick(); XXX do consumers of this flow need us to defer emitting this til end of tick explicitly?
+
+        let r_log = log.send_bincode_external(&external);
+        let r_snapshot = snapshot.all_ticks().send_bincode_external(&external);
+
+        let nodes = flow
+            .with_process(&process_node, deployment.Localhost())
+            .with_external(&external, deployment.Localhost())
+            .deploy(&mut deployment);
+
+        deployment.deploy().await.unwrap();
+
+        let mut external_in = nodes.connect_sink_bincode(r_send).await;
+        let mut log_stream = nodes.connect_source_bincode(r_log).await;
+        let mut snapshot_stream = nodes.connect_source_bincode(r_snapshot).await;
+
+        deployment.start().await.unwrap();
+
+        external_in
+            .send(LogEntry {
+                value: ZTuple {
+                    tuple: 42u32,
+                    count: 1,
+                },
+                xid: 1,
+            })
+            .await
+            .unwrap();
+
+        external_in
+            .send(LogEntry {
+                value: ZTuple {
+                    tuple: 42u32,
+                    count: 1,
+                },
+                xid: 2,
+            })
+            .await
+            .unwrap();
+
+        external_in
+            .send(LogEntry {
+                value: ZTuple {
+                    tuple: 0u32,
+                    count: -1,
+                },
+                xid: 3,
+            })
+            .await
+            .unwrap();
+
+        external_in
+            .send(LogEntry {
+                value: ZTuple {
+                    tuple: 0u32,
+                    count: 1,
+                },
+                xid: 4,
+            })
+            .await
+            .unwrap();
+
+        let tup = log_stream
+            .by_ref()
+            .take(4)
+            .collect::<Vec<LogEntry<u32>>>()
+            .await;
+
+        assert_eq!(
+            vec![
+                LogEntry {
+                    value: ZTuple {
+                        tuple: 42u32,
+                        count: 1
+                    },
+                    xid: 1,
+                },
+                LogEntry {
+                    value: ZTuple {
+                        tuple: 42u32,
+                        count: 1
+                    },
+                    xid: 2,
+                },
+                LogEntry {
+                    value: ZTuple {
+                        tuple: 0u32,
+                        count: -1
+                    },
+                    xid: 3,
+                },
+                LogEntry {
+                    value: ZTuple {
+                        tuple: 0u32,
+                        count: 1
+                    },
+                    xid: 4,
+                },
+            ],
+            tup
+        );
+        let sn = snapshot_stream
+            .by_ref()
+            .take(2)
+            .collect::<Vec<(u32, i32)>>()
+            .await;
+        assert_eq!(vec![(42u32, 2), (0u32, 0)], sn);
     }
 }
