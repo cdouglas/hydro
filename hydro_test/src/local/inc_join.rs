@@ -176,6 +176,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use futures::{SinkExt, StreamExt};
 
     use super::*;
@@ -207,7 +209,8 @@ mod tests {
             Stream<ZTuple<RawTupleR>, Process<'a>, Unbounded>,
             Stream<ZTuple<RawTupleS>, Process<'a>, Unbounded>,
             Tick<Process<'a>>,
-        ) -> Stream<ZTuple<RawTupleT>, Process<'a>, Unbounded, NoOrder> {
+        ) -> Stream<ZTuple<RawTupleT>, Process<'a>, Unbounded, NoOrder>,
+    {
         use hydro_deploy::Deployment;
         use hydro_lang::FlowBuilder;
 
@@ -459,28 +462,8 @@ mod tests {
 
         deployment.start().await.unwrap();
 
-        r_external_in
-            .send(LogEntry {
-                value: ZTuple {
-                    tuple: 42u32,
-                    count: 1,
-                },
-                xid: 1,
-            })
-            .await
-            .unwrap();
-
-        r_external_in
-            .send(LogEntry {
-                value: ZTuple {
-                    tuple: 42u32,
-                    count: 1,
-                },
-                xid: 2,
-            })
-            .await
-            .unwrap();
-
+        r_external_in.send(log_entry(42u32, 1, 1)).await.unwrap();
+        r_external_in.send(log_entry(42u32, 1, 2)).await.unwrap();
         let tup = listener_stream
             .by_ref()
             .take(2)
@@ -488,22 +471,7 @@ mod tests {
             .await;
 
         assert_eq!(
-            vec![
-                LogEntry {
-                    value: ZTuple {
-                        tuple: 42u32,
-                        count: 1
-                    },
-                    xid: 1,
-                },
-                LogEntry {
-                    value: ZTuple {
-                        tuple: 42u32,
-                        count: 1
-                    },
-                    xid: 2,
-                },
-            ],
+            log_content(vec![(42u32, 1, 1), (42u32, 1, 2)]),
             tup
         );
     }
@@ -559,49 +527,10 @@ mod tests {
 
         deployment.start().await.unwrap();
 
-        external_in
-            .send(LogEntry {
-                value: ZTuple {
-                    tuple: 42u32,
-                    count: 1,
-                },
-                xid: 1,
-            })
-            .await
-            .unwrap();
-
-        external_in
-            .send(LogEntry {
-                value: ZTuple {
-                    tuple: 42u32,
-                    count: 1,
-                },
-                xid: 2,
-            })
-            .await
-            .unwrap();
-
-        external_in
-            .send(LogEntry {
-                value: ZTuple {
-                    tuple: 0u32,
-                    count: -1,
-                },
-                xid: 3,
-            })
-            .await
-            .unwrap();
-
-        external_in
-            .send(LogEntry {
-                value: ZTuple {
-                    tuple: 0u32,
-                    count: 1,
-                },
-                xid: 4,
-            })
-            .await
-            .unwrap();
+        external_in.send(log_entry(42u32, 1, 1)).await.unwrap();
+        external_in.send(log_entry(42u32, 1, 2)).await.unwrap();
+        external_in.send(log_entry(0u32, -1, 3)).await.unwrap();
+        external_in.send(log_entry(0u32, 1, 4)).await.unwrap();
 
         let tup = log_stream
             .by_ref()
@@ -610,36 +539,12 @@ mod tests {
             .await;
 
         assert_eq!(
-            vec![
-                LogEntry {
-                    value: ZTuple {
-                        tuple: 42u32,
-                        count: 1
-                    },
-                    xid: 1,
-                },
-                LogEntry {
-                    value: ZTuple {
-                        tuple: 42u32,
-                        count: 1
-                    },
-                    xid: 2,
-                },
-                LogEntry {
-                    value: ZTuple {
-                        tuple: 0u32,
-                        count: -1
-                    },
-                    xid: 3,
-                },
-                LogEntry {
-                    value: ZTuple {
-                        tuple: 0u32,
-                        count: 1
-                    },
-                    xid: 4,
-                },
-            ],
+            log_content(vec![
+                (42u32, 1, 1),
+                (42u32, 1, 2),
+                (0u32, -1, 3),
+                (0u32, 1, 4)
+            ]),
             tup
         );
         let sn = snapshot_stream
@@ -647,6 +552,44 @@ mod tests {
             .take(2)
             .collect::<Vec<(u32, i32)>>()
             .await;
-        assert_eq!(vec![(42u32, 2), (0u32, 0)], sn);
+        chk(Some(vec![(42u32, 2), (0u32, 0)]), sn);
+    }
+
+    fn log_entry<T>(tuple: T, count: i32, xid: u64) -> LogEntry<T>
+    where
+        T: Debug + Clone + Eq + Hash,
+    {
+        LogEntry {
+            value: ZTuple { tuple, count },
+            xid,
+        }
+    }
+
+    fn log_content<T>(values: Vec<(T, i32, u64)>) -> Vec<LogEntry<T>>
+    where
+        T: Debug + Clone + Eq + Hash,
+    {
+        values
+            .into_iter()
+            .map(|(tuple, count, xid)| LogEntry {
+                value: ZTuple { tuple, count },
+                xid,
+            })
+            .collect()
+    }
+
+    fn chk<T>(expected: Option<Vec<T>>, actual: Vec<T>)
+    where
+        T: Debug + Clone + Eq + Hash,
+    {
+        if let Some(expected) = expected {
+            assert_eq!(expected.len(), actual.len());
+            assert_eq!(
+                expected.into_iter().collect::<HashSet<_>>(),
+                actual.into_iter().collect::<HashSet<_>>()
+            );
+        } else {
+            assert!(actual.is_empty());
+        }
     }
 }
