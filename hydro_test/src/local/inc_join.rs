@@ -419,6 +419,8 @@ mod tests {
         test_join_basic(dbsp_batch_join_wrapper).await;
     }
 
+    /// LOGGING TESTS
+
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
     struct LogEntry<T>
     where
@@ -470,10 +472,7 @@ mod tests {
             .collect::<Vec<LogEntry<u32>>>()
             .await;
 
-        assert_eq!(
-            log_content(vec![(42u32, 1, 1), (42u32, 1, 2)]),
-            tup
-        );
+        assert_eq!(log_content(vec![(42u32, 1, 1), (42u32, 1, 2)]), tup);
     }
 
     #[tokio::test]
@@ -555,6 +554,170 @@ mod tests {
         chk(Some(vec![(42u32, 2), (0u32, 0)]), sn);
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+    enum Action<K, T>
+    where
+        T: Debug + Clone + Eq + Hash,
+    {
+        BEGIN { xid: u64 }, // currently ignored
+        READ { xid: u64, seq: u8, key: K },
+        WRITE { xid: u64, seq: u8, tuple: ZTuple<T> },
+        COMMIT { xid: u64, seq: u8 },
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+    enum LogAction<T>
+    where
+        T: Debug + Clone + Eq + Hash,
+    {
+        WRITE { xid: u64, seq: u8, tuple: ZTuple<T> },
+        COMMIT { xid: u64, seq: u8 },
+    }
+
+    #[tokio::test]
+    async fn test_batched_rw() {
+        use hydro_deploy::Deployment;
+        use hydro_lang::FlowBuilder;
+
+        let mut deployment = Deployment::new();
+
+        let flow = FlowBuilder::new();
+        let process_node = flow.process::<()>();
+        let external = flow.external::<()>();
+
+        let (incoming, in_stream) = process_node.source_external_bincode(&external);
+
+        let tick = process_node.tick();
+
+        // a stream of ZTuple insertions that came in a batch at a time
+        let log = in_stream
+            .batch(&tick, nondet!(/**  */))
+            .filter_map(q!(|a| match a {
+                Action::WRITE { xid, seq, tuple } => Some(LogAction::WRITE { xid, seq, tuple }),
+                Action::COMMIT { xid, seq } =>
+                    if seq < 32 {
+                        // hack for unordered stream; use a bitset to track if begin..end received
+                        Some(LogAction::COMMIT { xid, seq })
+                    } else {
+                        None
+                    },
+                _ => None,
+            }))
+            .persist()
+            .all_ticks();
+
+        // TODO BEGIN doesn't need seqno 0, assign to first action
+        // filter out incomplete transactions i.e., need begin/end/unbroken sequence
+        let log_commit = log
+            .clone()
+            .filter_map(q!(|entry: LogAction<_>| match entry {
+                LogAction::COMMIT { xid, seq } => Some((xid, (1 << seq) - 1 as u32)),
+                _ => None,
+            }))
+            .into_keyed()
+            .reduce_commutative(q!(|acc, mask| {
+                if *acc != mask {
+                    // not kosher; error?
+                    *acc |= mask;
+                }
+            }))
+            .snapshot(&tick, nondet!(/** */));
+
+        let writes = log
+            .clone()
+            .filter_map(q!(|entry: LogAction<_>| match entry {
+                LogAction::WRITE { xid, seq, tuple } => Some((xid, (seq, tuple))),
+                _ => None,
+            }));
+
+        let write_mask = writes
+            .into_keyed()
+            .fold_commutative(
+                q!(|| (0u32, Vec::new())),
+                q!(|(acc, tuples), (seq, tuple)| {
+                    let mask = (1 << seq) as u32;
+                    if (*acc & mask) == 0 {
+                        // ignore duplicates
+                        *acc |= mask;
+                        tuples.push(tuple);
+                    }
+                }),
+            )
+            .snapshot(&tick, nondet!(/** */));
+
+        let visible = log_commit
+            .entries()
+            .join(write_mask.entries())
+            .filter_map(q!(|(_xid, (bitmask, (mask, tuples)))| {
+                if bitmask ^ mask == 0 {
+                    Some(tuples)
+                } else {
+                    None
+                }
+            }))
+            .flatten_unordered();
+
+        // a KeyedSingleton: i.e. a map of tuples to multiplicities
+        let log_replayed = visible
+            .clone()
+            .map(q!(|ztup: ZTuple<_>| (ztup.tuple, ztup.count)))
+            .into_keyed()
+            .fold_commutative(q!(|| 0i32), q!(|acc, count| *acc += count));
+
+        // a snapshot of log_replayed at the end of this tick
+        let snapshot = log_replayed.entries().all_ticks();
+
+        let r_log = log.send_bincode_external(&external);
+        let r_snapshot = snapshot.send_bincode_external(&external);
+
+        let nodes = flow
+            .with_process(&process_node, deployment.Localhost())
+            .with_external(&external, deployment.Localhost())
+            .deploy(&mut deployment);
+
+        deployment.deploy().await.unwrap();
+
+        let mut external_in = nodes.connect_sink_bincode(incoming).await;
+        let mut log_stream = nodes.connect_source_bincode(r_log).await;
+        let mut snapshot_stream = nodes.connect_source_bincode(r_snapshot).await;
+
+        deployment.start().await.unwrap();
+
+        let mut a = Txn::new(1);
+        let mut b = Txn::new(2);
+
+        external_in.send(a.begin()).await.unwrap();
+        external_in.send(a.write(42u32, 1)).await.unwrap();
+        external_in.send(a.write(42u32, 1)).await.unwrap();
+        external_in.send(a.commit()).await.unwrap();
+
+        external_in.send(b.begin()).await.unwrap();
+        external_in.send(b.read(42u32)).await.unwrap();
+        external_in.send(b.commit()).await.unwrap();
+
+        // let tup = log_stream
+        //     .by_ref()
+        //     .take(4)
+        //     .collect::<Vec<LogAction<u32>>>()
+        //     .await;
+
+        // assert_eq!(
+        //     alog_content(vec![
+        //         (42u32, 1, 1),
+        //         (42u32, 1, 2),
+        //         (0u32, -1, 3),
+        //         (0u32, 1, 4)
+        //     ]),
+        //     tup
+        // );
+        let sn = snapshot_stream
+            .by_ref()
+            .take(1)
+            .collect::<Vec<(u32, i32)>>()
+            .await;
+        chk(Some(vec![(42u32, 2)]), sn);
+    }
+
     fn log_entry<T>(tuple: T, count: i32, xid: u64) -> LogEntry<T>
     where
         T: Debug + Clone + Eq + Hash,
@@ -563,6 +726,78 @@ mod tests {
             value: ZTuple { tuple, count },
             xid,
         }
+    }
+
+    struct Txn<T> {
+        xid: u64,
+        seq: i8,
+    }
+
+    impl<T> Txn<T>
+    where
+        T: Debug + Clone + Eq + Hash,
+    {
+        fn new(xid: u64) -> Self {
+            Self { xid, seq: 0 }
+        }
+        fn begin(&mut self) -> Action<_, T> {
+            assert!(self.seq == 0i8);
+            Action::BEGIN { xid: self.xid }
+        }
+        fn read<K>(&mut self, key: K) -> Action<K, T> {
+            assert!(self.seq >= 0);
+            let seq = self.seq;
+            self.seq += 1;
+            Action::READ {
+                xid: self.xid,
+                seq,
+                key,
+            }
+        }
+        fn write(&mut self, tuple: T, count: i32) -> Action<_, T> {
+            assert!(self.seq >= 0);
+            let seq = self.seq;
+            self.seq += 1;
+            Action::WRITE {
+                xid: self.xid,
+                seq,
+                tuple: ZTuple { tuple, count },
+            }
+        }
+        fn commit(&mut self) -> Action<_, T> {
+            assert!(self.seq >= 0);
+            self.seq = -1;
+            Action::COMMIT {
+                xid: self.xid,
+                seq: self.seq,
+            }
+        }
+    }
+
+    fn write_action<T>(tuple: T, count: i32, xid: u64) -> LogAction<T>
+    where
+        T: Debug + Clone + Eq + Hash,
+    {
+        LogAction::WRITE {
+            xid,
+            seq: 0,
+            tuple: ZTuple { tuple, count },
+        }
+    }
+
+    // TODO unfinished, just here for type check
+    fn alog_content<T>(values: Vec<(T, i32, u64)>) -> Vec<LogAction<T>>
+    where
+        T: Debug + Clone + Eq + Hash,
+    {
+        values
+            .into_iter()
+            .map(|(tuple, count, xid)| LogAction::WRITE {
+                xid,
+                seq: 0,
+                tuple: ZTuple { tuple, count },
+            })
+            .collect()
     }
 
     fn log_content<T>(values: Vec<(T, i32, u64)>) -> Vec<LogEntry<T>>
