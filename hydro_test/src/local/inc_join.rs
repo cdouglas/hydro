@@ -728,25 +728,30 @@ mod tests {
         }
     }
 
-    struct Txn<T> {
+    struct Txn {
         xid: u64,
         seq: i8,
     }
 
-    impl<T> Txn<T>
-    where
-        T: Debug + Clone + Eq + Hash,
-    {
+    impl Txn {
         fn new(xid: u64) -> Self {
             Self { xid, seq: 0 }
         }
-        fn begin(&mut self) -> Action<_, T> {
+        fn begin<K, T>(&mut self) -> Action<K, T>
+        where
+            K: Debug + Clone + Eq + Hash,
+            T: Debug + Clone + Eq + Hash,
+        {
             assert!(self.seq == 0i8);
             Action::BEGIN { xid: self.xid }
         }
-        fn read<K>(&mut self, key: K) -> Action<K, T> {
-            assert!(self.seq >= 0);
-            let seq = self.seq;
+        fn read<K, T>(&mut self, key: K) -> Action<K, T>
+        where
+            K: Debug + Clone + Eq + Hash,
+            T: Debug + Clone + Eq + Hash,
+        {
+            assert!(self.seq >= 0i8);
+            let seq = self.seq as u8;
             self.seq += 1;
             Action::READ {
                 xid: self.xid,
@@ -754,9 +759,13 @@ mod tests {
                 key,
             }
         }
-        fn write(&mut self, tuple: T, count: i32) -> Action<_, T> {
-            assert!(self.seq >= 0);
-            let seq = self.seq;
+        fn write<K, T>(&mut self, tuple: T, count: i32) -> Action<K, T>
+        where
+            K: Debug + Clone + Eq + Hash,
+            T: Debug + Clone + Eq + Hash,
+        {
+            assert!(self.seq >= 0i8);
+            let seq = self.seq as u8;
             self.seq += 1;
             Action::WRITE {
                 xid: self.xid,
@@ -764,13 +773,15 @@ mod tests {
                 tuple: ZTuple { tuple, count },
             }
         }
-        fn commit(&mut self) -> Action<_, T> {
-            assert!(self.seq >= 0);
+        fn commit<K, T>(&mut self) -> Action<K, T>
+        where
+            K: Debug + Clone + Eq + Hash,
+            T: Debug + Clone + Eq + Hash,
+        {
+            assert!(self.seq >= 0i8);
+            let seq = self.seq as u8;
             self.seq = -1;
-            Action::COMMIT {
-                xid: self.xid,
-                seq: self.seq,
-            }
+            Action::COMMIT { xid: self.xid, seq }
         }
     }
 
