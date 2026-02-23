@@ -32,11 +32,20 @@ fi
 #   ./run-claude-docker.sh -p "explain this codebase"
 #   ./run-claude-docker.sh -p "fix the build" --output-format json
 #   ./run-claude-docker.sh                        # interactive mode
+# Mount host shared libraries that host-built binaries (e.g. bd) need.
+# The container may ship a different ICU version than the host.
+HOST_LIB_MOUNTS=()
+for lib in /lib/x86_64-linux-gnu/libicu{i18n,uc,data}.so.*; do
+    [ -f "$lib" ] && HOST_LIB_MOUNTS+=(-v "$lib:$lib:ro")
+done
+
 exec docker run --rm "${TTY_ARGS[@]}" \
     --name "$CONTAINER_NAME" \
     --user "$HOST_UID:$HOST_GID" \
     -e HOME="$HOST_HOME" \
+    -e PATH="$HOST_HOME/.local/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     "${API_KEY_ARGS[@]}" \
+    "${HOST_LIB_MOUNTS[@]}" \
     -v "$HOST_HOME:$HOST_HOME" \
     -v "$(pwd):/workspace" \
     "$IMAGE_NAME" \
