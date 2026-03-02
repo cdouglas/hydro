@@ -6,7 +6,9 @@ use hydro_deploy::gcp::GcpNetwork;
 use hydro_deploy::{AwsNetwork, Deployment, Host};
 use hydro_lang::deploy::TrybuildHost;
 use hydro_lang::location::{Location, NetworkHint};
+use hydro_lang::prelude::q;
 use hydro_lang::viz::config::GraphConfig;
+use tokio_util::codec::LengthDelimitedCodec;
 
 type HostCreator = Box<dyn Fn(&mut Deployment) -> Arc<dyn Host>>;
 
@@ -78,18 +80,27 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         "-C opt-level=3 -C codegen-units=1 -C strip=none -C debuginfo=2 -C lto=off"
     };
 
-    let flow = hydro_lang::compile::builder::FlowBuilder::new();
+    let mut flow = hydro_lang::compile::builder::FlowBuilder::new();
 
     let process = flow.process::<()>();
     let external = flow.external::<()>();
 
-    let (port, input, _membership, output_ref) =
-        process.bidi_external_many_bincode(&external, NetworkHint::TcpPort(Some(4002)));
+    let (port, input, _membership, output_ref) = process
+        .bidi_external_many_bytes::<_, bytes::Bytes, LengthDelimitedCodec>(
+            &external,
+            NetworkHint::TcpPort(Some(4002)),
+        );
+
+    let decoded_input = input.map(q!(|data: bytes::BytesMut| {
+        bincode::deserialize::<hydro_test::external_client::counter_simple::IncrementRequest>(&data)
+            .unwrap()
+    }));
 
     output_ref.complete(hydro_test::external_client::counter_simple::counter_server(
-        input,
+        decoded_input,
         args.threshold,
-    ));
+    )
+    .map(q!(|response| bincode::serialize(&response).unwrap().into())));
 
     // Extract the IR BEFORE the builder is consumed by deployment methods
     let built = flow.finalize();
@@ -132,4 +143,10 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::signal::ctrl_c().await.unwrap();
     Ok(())
+}
+
+#[allow(dead_code)]
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    run_from_cli().await
 }

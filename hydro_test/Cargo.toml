@@ -39,6 +39,7 @@ stageleft_tool.workspace = true
 hydro_build_utils = { path = "../hydro_build_utils", version = "^0.0.1" }
 
 [dev-dependencies]
+bincode = "1.3.1"
 clap = { version = "4.4", features = ["derive"] }
 ctor = "0.2"
 dfir_lang = { path = "../dfir_lang", version = "^0.15.0" }

@@ -62,7 +62,7 @@ mod tests {
     async fn test_counter_simple_basic() {
         let mut deployment = Deployment::new();
 
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let external = builder.external::<()>();
         let p1 = builder.process();
 
@@ -125,7 +125,7 @@ mod tests {
     async fn test_counter_simple_many() {
         let mut deployment = Deployment::new();
 
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let external = builder.external::<()>();
         let p1 = builder.process();
 

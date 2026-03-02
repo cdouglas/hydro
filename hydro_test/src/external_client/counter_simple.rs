@@ -109,7 +109,7 @@ mod tests {
     async fn test_request_reinserted_until_complete() {
         let mut deployment = Deployment::new();
 
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let external = builder.external::<()>();
         let p1: Process<'_, ()> = builder.process();
 
@@ -148,7 +148,7 @@ mod tests {
     async fn test_multiple_requests_complete_after_threshold_reached() {
         let mut deployment = Deployment::new();
 
-        let builder = FlowBuilder::new();
+        let mut builder = FlowBuilder::new();
         let external = builder.external::<()>();
         let p1: Process<'_, ()> = builder.process();
 
